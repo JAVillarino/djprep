@@ -29,7 +29,7 @@ The project is **feature-complete** and ready for v0.1.0 release:
 | Error Handling | ✅ Complete | Actionable error messages with suggestions |
 | Concurrency | ✅ Complete | Bounded channel queue for stem backpressure |
 | Incremental Analysis | ✅ Complete | Skips already-analyzed files (--force to override) |
-| Tests | ✅ Complete | 25 unit + 9 integration + 2 doc tests |
+| Tests | ✅ Complete | 38 unit + 13 integration + 2 doc tests |
 
 **All Phase 5 (Polish) items complete:**
 - ✅ Metadata extraction (ID3/Vorbis tags)
@@ -673,3 +673,140 @@ src/error.rs                 # Error types (DjprepError enum)
 ```
 
 When stuck on Rust specifics (ownership, lifetimes, traits), ask for help. When stuck on architecture decisions, refer back to this document.
+
+---
+
+## AI Code Quality Checklist
+
+**MANDATORY**: After ANY significant code generation, run this checklist before considering the task complete.
+
+### Pre-Commit Verification
+```bash
+# 1. Compile check
+cargo check
+
+# 2. Run all tests
+cargo test
+
+# 3. Clippy with strict settings
+cargo clippy -- -D warnings
+
+# 4. Format check
+cargo fmt --check
+```
+
+### AI-Generated Code Audit Checklist
+
+When reviewing AI-generated Rust code, check for these common issues:
+
+#### 🔴 CRITICAL (Must Fix)
+
+| Issue | What to Look For | Fix |
+|-------|------------------|-----|
+| **Panics in library code** | `unwrap()`, `expect()`, `panic!()`, `assert!()` | Return `Result` or use `unwrap_or()` |
+| **Blocking in async/parallel** | `send()` on bounded channel in rayon | Use `send_timeout()` or `try_send()` |
+| **Division by zero** | `x / y` where y could be 0 | Check `y > 0` or use `checked_div()` |
+| **Integer overflow** | `a + b`, `a * b` in index math | Use `saturating_add()`, `checked_mul()` |
+| **Unsafe float casts** | `f64 as i64` without bounds check | Check `is_finite()` and range first |
+| **Empty collection access** | `vec[0]`, `slice.last().unwrap()` | Check `!is_empty()` or use `.get()` |
+
+#### 🟡 HIGH (Should Fix)
+
+| Issue | What to Look For | Fix |
+|-------|------------------|-----|
+| **Swallowed errors** | `let _ = result`, `if let Ok(x) = ...` | Log errors, propagate with `?` |
+| **Missing error context** | `PathBuf::new()` in errors | Include actual file path |
+| **Thread panics ignored** | `handle.join().is_err()` | Extract and log panic message |
+| **TOCTOU races** | Check-then-act on files | Use atomic operations or locks |
+| **Unbounded collections** | `Vec::new()` in loops | Pre-allocate with `with_capacity()` |
+
+#### 🟢 MEDIUM (Consider Fixing)
+
+| Issue | What to Look For | Fix |
+|-------|------------------|-----|
+| **Missing traits** | Structs without `Clone`, `PartialEq` | Add derives for usability |
+| **Magic numbers** | Hardcoded `32767`, `1024`, etc. | Extract to named constants |
+| **Unnecessary clones** | `.clone()` in hot paths | Use references where possible |
+| **String vs &str** | `fn foo(s: String)` parameters | Use `&str` if not taking ownership |
+
+### Rust-Specific Patterns to Enforce
+
+```rust
+// ❌ BAD: Panic on corrupted data
+assert!(index < len, "bounds check");
+
+// ✅ GOOD: Return error on corrupted data
+if index >= len {
+    return Err(Error::InvalidIndex { index, len });
+}
+
+// ❌ BAD: Blocking send in parallel context
+tx.send(job)?; // Can deadlock if receiver crashes
+
+// ✅ GOOD: Timeout-based send
+match tx.send_timeout(job, Duration::from_secs(30)) {
+    Ok(()) => {}
+    Err(SendTimeoutError::Timeout(_)) => warn!("Queue blocked"),
+    Err(SendTimeoutError::Disconnected(_)) => break,
+}
+
+// ❌ BAD: Float to int without validation
+let size = float_value as i64; // UB if NaN/Inf
+
+// ✅ GOOD: Validated cast
+let size = if float_value.is_finite() && float_value >= 0.0 {
+    float_value.min(i64::MAX as f64) as i64
+} else {
+    0
+};
+
+// ❌ BAD: Ignoring thread panic
+if handle.join().is_err() {
+    warn!("Thread panicked");
+}
+
+// ✅ GOOD: Extract panic info
+match handle.join() {
+    Ok(()) => {}
+    Err(panic_info) => {
+        let msg = panic_info.downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .unwrap_or("unknown".to_string());
+        error!("Thread panicked: {}", msg);
+    }
+}
+```
+
+### Post-Generation Audit Command
+
+After generating significant code, request:
+```
+Run a code quality audit focusing on:
+1. All unwrap/expect/panic calls
+2. All arithmetic that could overflow
+3. All float-to-int casts
+4. All channel send/recv patterns
+5. All file I/O error handling
+6. Missing trait derives on public types
+```
+
+### Constants Naming Convention
+
+Extract magic numbers to constants with clear names:
+```rust
+// Audio processing
+const SAMPLE_RATE_ANALYSIS: u32 = 22050;
+const SAMPLE_RATE_STEMS: u32 = 44100;
+
+// FFT parameters
+const NFFT: usize = 4096;
+const HOP_LENGTH: usize = 1024;
+
+// PCM conversion
+const PCM_I16_MAX: f32 = 32767.0;
+const PCM_I16_MIN: f32 = -32768.0;
+
+// Validation bounds
+const BPM_MIN_VALUE: f64 = 1.0;
+const BPM_MAX_VALUE: f64 = 999.99;
+```
