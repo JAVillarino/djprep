@@ -20,6 +20,14 @@ use super::model::find_model_path;
 #[cfg(feature = "stems")]
 use ort::session::Session;
 
+// PCM audio constants for WAV output
+#[cfg(feature = "stems")]
+const PCM_I16_MAX: f32 = 32767.0;
+#[cfg(feature = "stems")]
+const PCM_I16_MIN: f32 = -32768.0;
+#[cfg(feature = "stems")]
+const WAV_BITS_PER_SAMPLE: u16 = 16;
+
 /// ONNX Runtime based stem separator using HTDemucs
 pub struct OrtStemSeparator {
     /// Path to the ONNX model
@@ -256,9 +264,12 @@ impl OrtStemSeparator {
             reason: "ORT session not initialized".to_string(),
         })?;
 
-        let mut session = session_mutex.lock().map_err(|_| DjprepError::StemUnavailable {
-            reason: "Failed to acquire session lock".to_string(),
-        })?;
+        // Recover from mutex poisoning - if a previous inference panicked, we can
+        // still use the session since ONNX inference is idempotent
+        let mut session = session_mutex.lock().unwrap_or_else(|poisoned| {
+            warn!("Session mutex was poisoned (previous inference panicked), recovering...");
+            poisoned.into_inner()
+        });
 
         // Decode input audio at full fidelity (44.1kHz stereo)
         info!("Loading audio for stem separation...");
@@ -283,13 +294,17 @@ impl OrtStemSeparator {
             debug!("Processing chunk {}/{}", i + 1, chunks.len());
 
             // Prepare input tensor: shape (batch=1, channels=2, samples)
+            // Use slice assignment instead of element-by-element for efficiency
             let chunk_len = chunk.audio.len();
             let mut input_data = Array3::<f32>::zeros((1, 2, chunk_len));
 
-            for j in 0..chunk_len {
-                input_data[[0, 0, j]] = chunk.audio.left[j];
-                input_data[[0, 1, j]] = chunk.audio.right[j];
-            }
+            // Assign entire channel slices at once using ndarray's slice_mut
+            input_data
+                .slice_mut(ndarray::s![0, 0, ..])
+                .assign(&ndarray::ArrayView1::from(&chunk.audio.left));
+            input_data
+                .slice_mut(ndarray::s![0, 1, ..])
+                .assign(&ndarray::ArrayView1::from(&chunk.audio.right));
 
             // Create input tensor (ort 2.0 needs owned array)
             let input_tensor = Tensor::from_array(input_data)
@@ -297,12 +312,11 @@ impl OrtStemSeparator {
                     reason: format!("Failed to create input tensor: {}", e),
                 })?;
 
-            // Get input name from session
-            let input_name = session
-                .inputs
-                .first()
-                .map(|i| i.name.clone())
-                .unwrap_or_else(|| "input".to_string());
+            // Get input name from session - fail explicitly if model has no inputs
+            let input_info = session.inputs.first().ok_or_else(|| DjprepError::StemUnavailable {
+                reason: "Model has no input tensors defined".to_string(),
+            })?;
+            let input_name = input_info.name.clone();
 
             // Run inference
             let inputs = ort::inputs![input_name.as_str() => input_tensor];
@@ -330,11 +344,53 @@ impl OrtStemSeparator {
 
             let shape: Vec<i64> = output_shape.iter().copied().collect();
 
-            // Validate output shape
-            if shape.len() != 4 || shape[1] != 4 || shape[2] != 2 {
+            // Validate output shape: expect exactly (batch=1, stems=4, channels=2, samples)
+            // HTDemucs outputs: [1, 4, 2, num_samples] where 4 = vocals/drums/bass/other
+            if shape.len() != 4 {
                 return Err(DjprepError::StemUnavailable {
                     reason: format!(
-                        "Unexpected output shape {:?}, expected (1, 4, 2, samples)",
+                        "Expected 4D output tensor, got {}D with shape {:?}",
+                        shape.len(),
+                        shape
+                    ),
+                });
+            }
+
+            // Validate each dimension explicitly for clear error messages
+            if shape[0] != 1 {
+                return Err(DjprepError::StemUnavailable {
+                    reason: format!(
+                        "Expected batch size 1, got {} (shape {:?})",
+                        shape[0],
+                        shape
+                    ),
+                });
+            }
+            if shape[1] != 4 {
+                return Err(DjprepError::StemUnavailable {
+                    reason: format!(
+                        "Expected 4 stems (vocals/drums/bass/other), got {} (shape {:?})",
+                        shape[1],
+                        shape
+                    ),
+                });
+            }
+            if shape[2] != 2 {
+                return Err(DjprepError::StemUnavailable {
+                    reason: format!(
+                        "Expected 2 channels (stereo), got {} (shape {:?})",
+                        shape[2],
+                        shape
+                    ),
+                });
+            }
+
+            // Validate ONNX dimensions are positive before casting to usize
+            // Negative dimensions would wrap to huge values and cause OOM or panic
+            if shape[1] < 0 || shape[2] < 0 || shape[3] < 0 {
+                return Err(DjprepError::StemUnavailable {
+                    reason: format!(
+                        "Invalid negative dimension in ONNX output shape {:?}",
                         shape
                     ),
                 });
@@ -342,41 +398,86 @@ impl OrtStemSeparator {
 
             let output_samples = shape[3] as usize;
             let num_channels = shape[2] as usize;
+            let num_stems = shape[1] as usize;
+
+            // Validate buffer length matches claimed shape
+            // This confirms the tensor is contiguous in memory (C-order/row-major)
+            // Expected: batch(1) * stems(4) * channels(2) * samples
+            // Use checked arithmetic to prevent overflow
+            let expected_len = num_stems
+                .checked_mul(num_channels)
+                .and_then(|v| v.checked_mul(output_samples))
+                .ok_or_else(|| DjprepError::StemUnavailable {
+                    reason: format!(
+                        "ONNX shape {:?} would overflow memory calculation",
+                        shape
+                    ),
+                })?;
+
+            if output_data.len() != expected_len {
+                return Err(DjprepError::StemUnavailable {
+                    reason: format!(
+                        "Output buffer length {} doesn't match shape {:?} (expected {}). \
+                         Tensor may not be contiguous.",
+                        output_data.len(),
+                        shape,
+                        expected_len
+                    ),
+                });
+            }
 
             // Extract stems from flat tensor data
-            // Layout: [batch, stems, channels, samples] in row-major order
-            let extract_stem = |stem_idx: usize| -> StereoBuffer {
-                let mut left = Vec::with_capacity(output_samples);
-                let mut right = Vec::with_capacity(output_samples);
+            // ONNX tensors are row-major (C-order): [batch, stems, channels, samples]
+            // For shape [1, 4, 2, N], flat layout is:
+            //   stem0_left[0..N], stem0_right[N..2N],
+            //   stem1_left[2N..3N], stem1_right[3N..4N], ...
+            // We verified contiguity above via length check.
+            // Extract stem closure returns Result to handle corrupted model output gracefully
+            let extract_stem = |stem_idx: usize| -> Result<StereoBuffer> {
+                // Use checked arithmetic to prevent overflow
+                let stem_offset = stem_idx.saturating_mul(num_channels).saturating_mul(output_samples);
+                let left_start = stem_offset;
+                let right_start = stem_offset.saturating_add(output_samples);
 
-                for s in 0..output_samples {
-                    // Calculate flat index for row-major 4D array
-                    // Layout: [stem_idx][channel][sample] where channel 0=left, 1=right
-                    let stem_offset = stem_idx * num_channels * output_samples;
-                    let left_idx = stem_offset + s;
-                    let right_idx = stem_offset + output_samples + s;
-
-                    left.push(output_data[left_idx]);
-                    right.push(output_data[right_idx]);
+                // Validate bounds - return error instead of panicking on corrupted model output
+                // This allows graceful degradation: skip this file's stems instead of crashing
+                if left_start.saturating_add(output_samples) > output_data.len() {
+                    return Err(DjprepError::StemUnavailable {
+                        reason: format!(
+                            "Left channel bounds check failed for stem {}: offset {} + {} > {}",
+                            stem_idx, left_start, output_samples, output_data.len()
+                        ),
+                    });
+                }
+                if right_start.saturating_add(output_samples) > output_data.len() {
+                    return Err(DjprepError::StemUnavailable {
+                        reason: format!(
+                            "Right channel bounds check failed for stem {}: offset {} + {} > {}",
+                            stem_idx, right_start, output_samples, output_data.len()
+                        ),
+                    });
                 }
 
-                StereoBuffer::new(left, right, chunk.audio.sample_rate)
+                let left = output_data[left_start..left_start + output_samples].to_vec();
+                let right = output_data[right_start..right_start + output_samples].to_vec();
+
+                Ok(StereoBuffer::new(left, right, chunk.audio.sample_rate))
             };
 
             stem_chunks.push(StemChunk {
                 index: chunk.index,
                 start_sample: chunk.start_sample,
                 end_sample: chunk.end_sample,
-                vocals: extract_stem(0),
-                drums: extract_stem(1),
-                bass: extract_stem(2),
-                other: extract_stem(3),
+                vocals: extract_stem(0)?,
+                drums: extract_stem(1)?,
+                bass: extract_stem(2)?,
+                other: extract_stem(3)?,
             });
         }
 
         // Reassemble stems using overlap-add
         info!("Reassembling stems...");
-        let stems = overlap_add(&stem_chunks, &config, total_samples);
+        let stems = overlap_add(&stem_chunks, &config, total_samples)?;
 
         // Write output WAV files
         info!("Writing stem files...");
@@ -394,7 +495,7 @@ impl OrtStemSeparator {
         let spec = hound::WavSpec {
             channels: 2,
             sample_rate: audio.sample_rate,
-            bits_per_sample: 16,
+            bits_per_sample: WAV_BITS_PER_SAMPLE,
             sample_format: hound::SampleFormat::Int,
         };
 
@@ -406,8 +507,8 @@ impl OrtStemSeparator {
 
         // Write interleaved stereo samples
         for (l, r) in audio.left.iter().zip(audio.right.iter()) {
-            let l_i16 = (*l * 32767.0).clamp(-32768.0, 32767.0) as i16;
-            let r_i16 = (*r * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            let l_i16 = (*l * PCM_I16_MAX).clamp(PCM_I16_MIN, PCM_I16_MAX) as i16;
+            let r_i16 = (*r * PCM_I16_MAX).clamp(PCM_I16_MIN, PCM_I16_MAX) as i16;
 
             writer
                 .write_sample(l_i16)

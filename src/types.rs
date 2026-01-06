@@ -95,7 +95,7 @@ pub enum Mode {
 // =============================================================================
 
 /// BPM analysis result
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BpmResult {
     /// Primary detected BPM
     pub value: f64,
@@ -116,7 +116,7 @@ impl Default for BpmResult {
 }
 
 /// Musical key analysis result
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeyResult {
     /// Detected pitch class (C, C#, D, etc.)
     pub pitch_class: PitchClass,
@@ -143,7 +143,7 @@ impl Default for KeyResult {
 }
 
 /// Paths to separated stem files
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StemPaths {
     pub vocals: PathBuf,
     pub drums: PathBuf,
@@ -156,7 +156,7 @@ pub struct StemPaths {
 // =============================================================================
 
 /// Metadata extracted from audio file tags
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackMetadata {
     pub title: Option<String>,
     pub artist: Option<String>,
@@ -222,7 +222,12 @@ pub struct AudioBuffer {
 
 impl AudioBuffer {
     pub fn new(samples: Vec<f32>, sample_rate: u32) -> Self {
-        let duration = samples.len() as f64 / sample_rate as f64;
+        // Guard against division by zero - use 0 duration for invalid sample rate
+        let duration = if sample_rate > 0 {
+            samples.len() as f64 / sample_rate as f64
+        } else {
+            0.0
+        };
         Self {
             samples,
             sample_rate,
@@ -257,7 +262,12 @@ pub struct StereoBuffer {
 impl StereoBuffer {
     pub fn new(left: Vec<f32>, right: Vec<f32>, sample_rate: u32) -> Self {
         let num_samples = left.len().min(right.len());
-        let duration = num_samples as f64 / sample_rate as f64;
+        // Guard against division by zero - use 0 duration for invalid sample rate
+        let duration = if sample_rate > 0 {
+            num_samples as f64 / sample_rate as f64
+        } else {
+            0.0
+        };
         Self {
             left,
             right,

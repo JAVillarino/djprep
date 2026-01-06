@@ -13,7 +13,7 @@ use crate::discovery::{self, DiscoveredFile};
 use crate::error::{DjprepError, Result};
 use crate::export;
 use crate::types::{AnalyzedTrack, StemPaths};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::path::PathBuf;
@@ -307,17 +307,27 @@ fn analyze_files(
     };
 
     // Set up stem worker thread if stem separation is enabled
+    // Channel capacity of 4 provides backpressure: when the GPU stem worker is busy,
+    // analysis threads will block on send(), naturally throttling CPU work to match
+    // GPU throughput. Capacity chosen to allow some buffering without excessive memory
+    // use (~4 chunks × ~7.8s × 44.1kHz × 2ch × 4bytes ≈ 11MB peak buffer).
+    const STEM_CHANNEL_CAPACITY: usize = 4;
     let (stem_tx, stem_rx): (Option<Sender<StemJob>>, Option<Receiver<StemJob>>) =
         if stem_separator.is_some() {
-            let (tx, rx) = bounded::<StemJob>(4); // Bounded channel with capacity 4
+            let (tx, rx) = bounded::<StemJob>(STEM_CHANNEL_CAPACITY);
             (Some(tx), Some(rx))
         } else {
             (None, None)
         };
 
+    // Result channel is UNBOUNDED to prevent deadlock:
+    // The stem worker sends results while main thread waits on join().
+    // If result channel were bounded, the worker could block on send() while
+    // main thread blocks on join(), causing deadlock. Unbounded channel allows
+    // worker to complete all sends before main thread drains results.
     let (result_tx, result_rx): (Option<Sender<StemResult>>, Option<Receiver<StemResult>>) =
         if stem_separator.is_some() {
-            let (tx, rx) = bounded::<StemResult>(4);
+            let (tx, rx) = unbounded::<StemResult>();
             (Some(tx), Some(rx))
         } else {
             (None, None)
@@ -372,9 +382,25 @@ fn analyze_files(
                             input_path: file.path.clone(),
                             output_dir: stems_dir.clone(),
                         };
-                        // Non-blocking send - if channel is full, we'll wait (backpressure)
-                        if tx.send(job).is_err() {
-                            warn!("Failed to submit stem job for {}", file.path.display());
+                        // Use send_timeout to prevent deadlock if stem worker crashes.
+                        // Timeout is generous - if channel is blocked that long,
+                        // the stem worker is likely dead. This allows rayon threads to continue
+                        // rather than blocking forever.
+                        use std::time::Duration;
+                        match tx.send_timeout(job, Duration::from_secs(STEM_SEND_TIMEOUT_SECS)) {
+                            Ok(()) => {}
+                            Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
+                                warn!(
+                                    "Stem job queue blocked for {}s, skipping stems for {}. \
+                                     Stem worker may have crashed.",
+                                    STEM_SEND_TIMEOUT_SECS,
+                                    file.path.display()
+                                );
+                            }
+                            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                                // Stem worker has shut down, channel closed
+                                debug!("Stem channel closed, skipping stems for {}", file.path.display());
+                            }
                         }
                     }
 
@@ -414,8 +440,24 @@ fn analyze_files(
 
     // Wait for stem worker to complete
     if let Some(handle) = stem_handle {
-        if handle.join().is_err() {
-            warn!("Stem worker thread panicked");
+        match handle.join() {
+            Ok(()) => {
+                debug!("Stem worker thread completed successfully");
+            }
+            Err(panic_info) => {
+                // Extract panic message if possible
+                let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                error!(
+                    "Stem worker thread panicked: {}. Some stems may not have been generated.",
+                    panic_msg
+                );
+            }
         }
     }
 
@@ -480,6 +522,14 @@ fn stem_worker(
     }
 }
 
+/// Minimum audio duration in seconds required for reliable analysis
+/// stratum-dsp needs at least 3-5 seconds for BPM/key detection
+const MIN_AUDIO_DURATION_SECS: f64 = 3.0;
+
+/// Timeout for sending stem jobs to the worker thread (seconds)
+/// If the queue is blocked this long, the stem worker may have crashed
+const STEM_SEND_TIMEOUT_SECS: u64 = 30;
+
 /// Analyze a single file
 fn analyze_single_file(
     file: &DiscoveredFile,
@@ -494,11 +544,40 @@ fn analyze_single_file(
     // Decode audio
     let buffer = audio::decode(&file.path)?;
 
+    // Validate minimum duration for reliable analysis
+    if buffer.duration < MIN_AUDIO_DURATION_SECS {
+        return Err(DjprepError::AnalysisError {
+            path: file.path.clone(),
+            reason: format!(
+                "Audio too short ({:.1}s). Minimum {:.0}s required for reliable BPM/key detection.",
+                buffer.duration, MIN_AUDIO_DURATION_SECS
+            ),
+        });
+    }
+
     // Run BPM detection
-    let bpm = bpm_detector.detect(&buffer)?;
+    let bpm = bpm_detector.detect(&buffer).map_err(|e| {
+        // Add file context to analysis errors
+        match e {
+            DjprepError::AnalysisError { reason, .. } => DjprepError::AnalysisError {
+                path: file.path.clone(),
+                reason,
+            },
+            other => other,
+        }
+    })?;
 
     // Run key detection
-    let key = key_detector.detect(&buffer)?;
+    let key = key_detector.detect(&buffer).map_err(|e| {
+        // Add file context to analysis errors
+        match e {
+            DjprepError::AnalysisError { reason, .. } => DjprepError::AnalysisError {
+                path: file.path.clone(),
+                reason,
+            },
+            other => other,
+        }
+    })?;
 
     // Create analyzed track
     let mut track = AnalyzedTrack::new(file.path.clone(), track_id);

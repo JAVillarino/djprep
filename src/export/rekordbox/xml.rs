@@ -15,11 +15,39 @@ use tracing::info;
 use super::schema::{self, attrs, node_types};
 use super::uri::path_to_rekordbox_uri;
 
+// BPM validation constants
+const BPM_MIN_VALUE: f64 = 1.0;
+const BPM_MAX_VALUE: f64 = 999.99;
+const DEFAULT_BPM: &str = "120.00";
+
+// Confidence scaling
+const CONFIDENCE_PERCENT_SCALE: f64 = 100.0;
+const CONFIDENCE_MIN: f64 = 0.0;
+const CONFIDENCE_MAX: f64 = 100.0;
+
+// Playlist name prefix for import workaround
+const PLAYLIST_PREFIX: &str = "djprep_import_";
+
 /// Write analyzed tracks to a Rekordbox XML file
+///
+/// Uses atomic write pattern: writes to a temp file first, then renames.
+/// This prevents data corruption if the write is interrupted.
 pub fn write_rekordbox_xml(tracks: &[AnalyzedTrack], output_path: &Path) -> Result<()> {
-    let file = File::create(output_path).map_err(|e| DjprepError::OutputError {
+    // Write to temp file in same directory (ensures same filesystem for atomic rename)
+    let temp_path = output_path.with_extension("xml.tmp");
+
+    // Helper to clean up temp file on error
+    let cleanup_and_error = |reason: String| -> DjprepError {
+        let _ = std::fs::remove_file(&temp_path);
+        DjprepError::OutputError {
+            path: output_path.to_path_buf(),
+            reason,
+        }
+    };
+
+    let file = File::create(&temp_path).map_err(|e| DjprepError::OutputError {
         path: output_path.to_path_buf(),
-        reason: e.to_string(),
+        reason: format!("Failed to create temp file: {}", e),
     })?;
 
     let writer = BufWriter::new(file);
@@ -31,42 +59,60 @@ pub fn write_rekordbox_xml(tracks: &[AnalyzedTrack], output_path: &Path) -> Resu
         Some(schema::XML_ENCODING),
         None,
     )))
-    .map_err(|e| write_error(output_path, e))?;
+    .map_err(|e| cleanup_and_error(format!("XML write error: {}", e)))?;
 
     // Root element: DJ_PLAYLISTS
     let mut root = BytesStart::new("DJ_PLAYLISTS");
     root.push_attribute(("Version", schema::PLAYLISTS_VERSION));
     xml.write_event(Event::Start(root))
-        .map_err(|e| write_error(output_path, e))?;
+        .map_err(|e| cleanup_and_error(format!("XML write error: {}", e)))?;
 
     // PRODUCT element
     let mut product = BytesStart::new("PRODUCT");
     product.push_attribute(("Name", schema::PRODUCT_NAME));
     product.push_attribute(("Version", schema::PRODUCT_VERSION));
     xml.write_event(Event::Empty(product))
-        .map_err(|e| write_error(output_path, e))?;
+        .map_err(|e| cleanup_and_error(format!("XML write error: {}", e)))?;
 
     // COLLECTION element
     let mut collection = BytesStart::new("COLLECTION");
     collection.push_attribute(("Entries", tracks.len().to_string().as_str()));
     xml.write_event(Event::Start(collection))
-        .map_err(|e| write_error(output_path, e))?;
+        .map_err(|e| cleanup_and_error(format!("XML write error: {}", e)))?;
 
     // Write each track
     for track in tracks {
-        write_track(&mut xml, track, output_path)?;
+        write_track(&mut xml, track, &temp_path).map_err(|e| {
+            let _ = std::fs::remove_file(&temp_path);
+            e
+        })?;
     }
 
     // Close COLLECTION
     xml.write_event(Event::End(BytesEnd::new("COLLECTION")))
-        .map_err(|e| write_error(output_path, e))?;
+        .map_err(|e| cleanup_and_error(format!("XML write error: {}", e)))?;
 
     // PLAYLISTS section (with import workaround playlist)
-    write_playlists(&mut xml, tracks, output_path)?;
+    write_playlists(&mut xml, tracks, &temp_path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path);
+        e
+    })?;
 
     // Close DJ_PLAYLISTS
     xml.write_event(Event::End(BytesEnd::new("DJ_PLAYLISTS")))
-        .map_err(|e| write_error(output_path, e))?;
+        .map_err(|e| cleanup_and_error(format!("XML write error: {}", e)))?;
+
+    // Flush and drop the writer before rename
+    drop(xml);
+
+    // Atomic rename: either succeeds completely or fails without modifying target
+    std::fs::rename(&temp_path, output_path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path);
+        DjprepError::OutputError {
+            path: output_path.to_path_buf(),
+            reason: format!("Failed to finalize file: {}", e),
+        }
+    })?;
 
     info!("Wrote {} tracks to {}", tracks.len(), output_path.display());
 
@@ -85,19 +131,19 @@ fn write_track<W: std::io::Write>(
     elem.push_attribute((attrs::TRACK_ID, track.track_id.to_string().as_str()));
 
     // Name (from metadata or filename)
-    let name = track
-        .metadata
-        .title
-        .clone()
-        .unwrap_or_else(|| {
+    // Use as_deref() to avoid cloning when title exists
+    let name: std::borrow::Cow<str> = match track.metadata.title.as_deref() {
+        Some(title) => std::borrow::Cow::Borrowed(title),
+        None => std::borrow::Cow::Owned(
             track
                 .path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("Unknown")
-                .to_string()
-        });
-    elem.push_attribute((attrs::NAME, name.as_str()));
+                .to_string(),
+        ),
+    };
+    elem.push_attribute((attrs::NAME, name.as_ref()));
 
     // Artist
     if let Some(ref artist) = track.metadata.artist {
@@ -118,12 +164,20 @@ fn write_track<W: std::io::Write>(
     let location = path_to_rekordbox_uri(&track.path);
     elem.push_attribute((attrs::LOCATION, location.as_str()));
 
-    // Duration
-    let total_time = track.duration_seconds.round() as i64;
+    // Duration - guard against NaN/Inf which would cause undefined behavior in cast
+    let total_time = if track.duration_seconds.is_finite() && track.duration_seconds >= 0.0 {
+        track.duration_seconds.round().min(i64::MAX as f64) as i64
+    } else {
+        0 // Use 0 for invalid duration
+    };
     elem.push_attribute((attrs::TOTAL_TIME, total_time.to_string().as_str()));
 
-    // BPM (2 decimal places)
-    let bpm = format!("{:.2}", track.bpm.value);
+    // BPM (2 decimal places) - guard against NaN/Inf for valid XML
+    let bpm = if track.bpm.value.is_finite() && track.bpm.value > 0.0 {
+        format!("{:.2}", track.bpm.value.clamp(BPM_MIN_VALUE, BPM_MAX_VALUE))
+    } else {
+        DEFAULT_BPM.to_string() // Reasonable default for invalid BPM
+    };
     elem.push_attribute((attrs::AVERAGE_BPM, bpm.as_str()));
 
     // Key (Camelot notation)
@@ -136,11 +190,20 @@ fn write_track<W: std::io::Write>(
     // Sample rate
     elem.push_attribute((attrs::SAMPLE_RATE, track.sample_rate.to_string().as_str()));
 
-    // Comments (include analysis confidence info)
+    // Comments (include analysis confidence info) - clamp confidence to valid range
+    let bpm_conf = if track.bpm.confidence.is_finite() {
+        (track.bpm.confidence * CONFIDENCE_PERCENT_SCALE).clamp(CONFIDENCE_MIN, CONFIDENCE_MAX)
+    } else {
+        CONFIDENCE_MIN
+    };
+    let key_conf = if track.key.confidence.is_finite() {
+        (track.key.confidence * CONFIDENCE_PERCENT_SCALE).clamp(CONFIDENCE_MIN, CONFIDENCE_MAX)
+    } else {
+        CONFIDENCE_MIN
+    };
     let comment = format!(
         "djprep: BPM conf={:.0}%, Key conf={:.0}%",
-        track.bpm.confidence * 100.0,
-        track.key.confidence * 100.0
+        bpm_conf, key_conf
     );
     elem.push_attribute((attrs::COMMENTS, comment.as_str()));
 
@@ -171,7 +234,7 @@ fn write_playlists<W: std::io::Write>(
     // Import workaround playlist
     // Per Section 4.4 of spec: Rekordbox only updates metadata via playlist import
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    let playlist_name = format!("djprep_import_{}", timestamp);
+    let playlist_name = format!("{}{}", PLAYLIST_PREFIX, timestamp);
 
     let mut playlist_node = BytesStart::new("NODE");
     playlist_node.push_attribute(("Type", node_types::PLAYLIST));
@@ -205,9 +268,15 @@ fn write_playlists<W: std::io::Write>(
     Ok(())
 }
 
+/// Convert I/O errors during XML writing to DjprepError
+///
+/// Note: `Writer::write_event` returns `io::Result<()>` when the underlying
+/// writer is `BufWriter<File>`, so we receive `std::io::Error` here rather
+/// than `quick_xml::Error`. This is intentional - the quick_xml Writer
+/// propagates I/O errors directly from the underlying writer.
 fn write_error(path: &Path, e: std::io::Error) -> DjprepError {
     DjprepError::OutputError {
         path: path.to_path_buf(),
-        reason: e.to_string(),
+        reason: format!("XML write error: {}", e),
     }
 }

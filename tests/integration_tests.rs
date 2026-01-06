@@ -275,9 +275,10 @@ fn test_pipeline_multiple_files() {
     let output_dir = TempDir::new().expect("Failed to create output temp dir");
 
     // Generate multiple test files with different frequencies
-    generate_sine_wav(&input_dir.path().join("track_a.wav"), 261.63, 2.0, 44100); // C4
-    generate_sine_wav(&input_dir.path().join("track_b.wav"), 329.63, 2.0, 44100); // E4
-    generate_sine_wav(&input_dir.path().join("track_c.wav"), 392.00, 2.0, 44100); // G4
+    // Files must be at least 3 seconds for reliable BPM/key analysis
+    generate_sine_wav(&input_dir.path().join("track_a.wav"), 261.63, 4.0, 44100); // C4
+    generate_sine_wav(&input_dir.path().join("track_b.wav"), 329.63, 4.0, 44100); // E4
+    generate_sine_wav(&input_dir.path().join("track_c.wav"), 392.00, 4.0, 44100); // G4
 
     // Run the pipeline
     let settings = create_test_settings(input_dir.path(), output_dir.path());
@@ -618,8 +619,9 @@ fn test_metadata_fallback_to_filename() {
     let output_dir = TempDir::new().expect("Failed to create output temp dir");
 
     // Create a WAV file with a descriptive filename (no metadata tags)
+    // File must be at least 3 seconds for reliable BPM/key analysis
     let wav_path = input_dir.path().join("Artist_Name_-_Track_Title.wav");
-    generate_sine_wav(&wav_path, 440.0, 1.0, 44100);
+    generate_sine_wav(&wav_path, 440.0, 4.0, 44100);
 
     // Run pipeline
     let settings = create_test_settings(input_dir.path(), output_dir.path());

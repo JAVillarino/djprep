@@ -1,9 +1,11 @@
 //! Audio decoding using symphonia
 //!
 //! Decodes audio files to mono f32 samples at the target sample rate.
+//! Uses rubato for high-quality resampling with proper anti-aliasing.
 
 use crate::error::{DjprepError, Result};
 use crate::types::{AudioBuffer, StereoBuffer};
+use rubato::{FftFixedInOut, Resampler};
 use std::path::Path;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
@@ -14,7 +16,7 @@ use symphonia::core::probe::Hint;
 use tracing::{debug, trace};
 
 /// Target sample rate for analysis (22050 Hz)
-/// 
+///
 /// This is sufficient for BPM and key detection (frequencies < 11kHz)
 /// while reducing computation by 50% compared to 44.1kHz
 pub const TARGET_SAMPLE_RATE: u32 = 22050;
@@ -22,6 +24,12 @@ pub const TARGET_SAMPLE_RATE: u32 = 22050;
 /// Maximum file size we'll attempt to decode (2GB)
 /// Prevents OOM on extremely large files
 const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Default sample rate if not specified in file metadata
+const DEFAULT_SAMPLE_RATE: u32 = 44100;
+
+/// Default channel count if not specified in file metadata
+const DEFAULT_CHANNELS: usize = 2;
 
 /// Decode an audio file to a mono AudioBuffer
 pub fn decode(path: &Path) -> Result<AudioBuffer> {
@@ -77,8 +85,8 @@ pub fn decode(path: &Path) -> Result<AudioBuffer> {
     let track_id = track.id;
     let codec_params = track.codec_params.clone();
 
-    let source_sample_rate = codec_params.sample_rate.unwrap_or(44100);
-    let channels = codec_params.channels.map(|c| c.count()).unwrap_or(2);
+    let source_sample_rate = codec_params.sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE);
+    let channels = codec_params.channels.map(|c| c.count()).unwrap_or(DEFAULT_CHANNELS);
 
     debug!(
         "Decoding: {} @ {}Hz, {} channels",
@@ -166,38 +174,178 @@ pub fn decode(path: &Path) -> Result<AudioBuffer> {
 
 /// Convert interleaved multi-channel audio to mono
 fn to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
+    // Handle edge cases that would cause division by zero or incorrect behavior
+    if channels == 0 {
+        return Vec::new();
+    }
     if channels == 1 {
         return samples.to_vec();
     }
 
     samples
         .chunks(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+        .map(|frame| {
+            // Use actual frame length to avoid division by zero on incomplete frames
+            if frame.is_empty() {
+                0.0
+            } else {
+                frame.iter().sum::<f32>() / frame.len() as f32
+            }
+        })
         .collect()
 }
 
-/// Simple linear interpolation resampler
+/// High-quality audio resampling using rubato
 ///
-/// For production, consider using rubato crate for higher quality
+/// Uses FFT-based resampling with proper anti-aliasing filter to prevent
+/// aliasing artifacts when downsampling. This is critical for accurate
+/// frequency analysis in BPM and key detection.
+///
+/// The resampler uses a sinc interpolation kernel with configurable quality.
+/// For analysis (mono, 22kHz), we use moderate quality settings that balance
+/// accuracy with performance.
 fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    // Handle edge cases that would cause division by zero or incorrect behavior
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    if from_rate == 0 || to_rate == 0 {
+        // Invalid sample rates - return original samples rather than panic
+        debug!("Invalid sample rate (from={}, to={}), skipping resample", from_rate, to_rate);
+        return samples.to_vec();
+    }
+    if from_rate == to_rate {
+        return samples.to_vec();
+    }
+
+    // Calculate chunk size - rubato works on fixed-size chunks
+    // Use a reasonable chunk size for efficiency
+    const CHUNK_SIZE: usize = 1024;
+
+    // Create resampler with FFT-based algorithm
+    // FftFixedInOut provides good quality with reasonable performance
+    let mut resampler = match FftFixedInOut::<f32>::new(
+        from_rate as usize,
+        to_rate as usize,
+        CHUNK_SIZE,
+        1, // mono channel
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            // Fallback to simple resampling if rubato fails to initialize
+            debug!("Rubato initialization failed ({}), using fallback", e);
+            return resample_linear_fallback(samples, from_rate, to_rate);
+        }
+    };
+
+    let input_frames_per_chunk = resampler.input_frames_next();
+    let output_frames_per_chunk = resampler.output_frames_next();
+
+    // Validate rubato returned valid frame counts
+    if input_frames_per_chunk == 0 || output_frames_per_chunk == 0 {
+        debug!("Rubato returned zero frame count, using fallback");
+        return resample_linear_fallback(samples, from_rate, to_rate);
+    }
+
+    // Estimate output size with overflow protection
+    let ratio = to_rate as f64 / from_rate as f64;
+    let estimated_output_len = ((samples.len() as f64 * ratio).ceil() as usize)
+        .min(samples.len().saturating_mul(4)); // Cap at 4x input length as sanity check
+    let mut output = Vec::with_capacity(estimated_output_len);
+
+    // Process in chunks using saturating arithmetic to prevent overflow
+    let mut pos = 0;
+    while pos < samples.len() {
+        let end = pos.saturating_add(input_frames_per_chunk).min(samples.len());
+        let mut chunk = samples[pos..end].to_vec();
+
+        // Pad last chunk if needed
+        if chunk.len() < input_frames_per_chunk {
+            chunk.resize(input_frames_per_chunk, 0.0);
+        }
+
+        // Rubato expects Vec<Vec<f32>> for multi-channel, we have mono
+        let input_channels = vec![chunk];
+
+        match resampler.process(&input_channels, None) {
+            Ok(resampled) => {
+                if let Some(channel) = resampled.first() {
+                    // Only take valid samples (not padding)
+                    let valid_samples = if pos.saturating_add(input_frames_per_chunk) > samples.len() {
+                        // Last chunk - calculate how many output samples are valid
+                        let input_valid = samples.len().saturating_sub(pos);
+                        let output_valid = (input_valid as f64 * ratio).ceil() as usize;
+                        output_valid.min(output_frames_per_chunk)
+                    } else {
+                        output_frames_per_chunk
+                    };
+                    // Guard against floating-point rounding causing out-of-bounds
+                    let safe_samples = valid_samples.min(channel.len());
+                    output.extend_from_slice(&channel[..safe_samples]);
+                }
+            }
+            Err(e) => {
+                debug!("Rubato processing error ({}), using fallback for remaining", e);
+                // Fallback for remaining samples
+                let remaining = resample_linear_fallback(&samples[pos..], from_rate, to_rate);
+                output.extend(remaining);
+                break;
+            }
+        }
+
+        pos = pos.saturating_add(input_frames_per_chunk);
+    }
+
+    output
+}
+
+/// Fallback linear interpolation resampler
+///
+/// Used only when rubato fails to initialize or process. This is a simple
+/// linear interpolation that may introduce aliasing artifacts.
+fn resample_linear_fallback(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    // Handle edge cases that would cause division by zero or out-of-bounds access
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    if from_rate == 0 || to_rate == 0 {
+        // Invalid sample rates - return original samples rather than panic
+        return samples.to_vec();
+    }
     if from_rate == to_rate {
         return samples.to_vec();
     }
 
     let ratio = from_rate as f64 / to_rate as f64;
+    // Protect against ratio producing zero or huge output lengths
+    if ratio <= 0.0 || !ratio.is_finite() {
+        return samples.to_vec();
+    }
+
     let output_len = (samples.len() as f64 / ratio) as usize;
+    // Sanity check: output shouldn't be more than 10x input (very generous)
+    let output_len = output_len.min(samples.len().saturating_mul(10));
+    if output_len == 0 {
+        return Vec::new();
+    }
+
     let mut output = Vec::with_capacity(output_len);
 
     for i in 0..output_len {
         let src_pos = i as f64 * ratio;
         let src_idx = src_pos as usize;
-        let frac = src_pos - src_idx as f64;
+        let frac = (src_pos - src_idx as f64) as f32;
 
-        let sample = if src_idx + 1 < samples.len() {
-            // Linear interpolation
-            samples[src_idx] * (1.0 - frac as f32) + samples[src_idx + 1] * frac as f32
+        // Safe indexing with bounds checking
+        let sample = if src_idx >= samples.len() {
+            // Past end of samples - use last sample
+            *samples.last().unwrap() // Safe: we checked is_empty() above
+        } else if src_idx + 1 < samples.len() {
+            // Normal case: interpolate between two samples
+            samples[src_idx] * (1.0 - frac) + samples[src_idx + 1] * frac
         } else {
-            samples[src_idx.min(samples.len() - 1)]
+            // At last sample - no interpolation
+            samples[src_idx]
         };
 
         output.push(sample);
@@ -214,6 +362,23 @@ pub const STEM_SAMPLE_RATE: u32 = 44100;
 /// Unlike `decode()`, this preserves stereo channels and uses 44.1kHz
 /// which is required by HTDemucs and other stem separation models.
 pub fn decode_stereo(path: &Path) -> Result<StereoBuffer> {
+    // Check file size before attempting to decode (same as decode())
+    // Stereo decoding uses 2x memory, so this check is even more important
+    let metadata = std::fs::metadata(path).map_err(|e| DjprepError::DecodeError {
+        path: path.to_path_buf(),
+        reason: format!("Failed to read file metadata: {}", e),
+    })?;
+
+    if metadata.len() > MAX_FILE_SIZE {
+        return Err(DjprepError::DecodeError {
+            path: path.to_path_buf(),
+            reason: format!(
+                "File too large ({:.1} GB). Maximum supported size is 2 GB.",
+                metadata.len() as f64 / (1024.0 * 1024.0 * 1024.0)
+            ),
+        });
+    }
+
     let file = std::fs::File::open(path).map_err(|e| DjprepError::DecodeError {
         path: path.to_path_buf(),
         reason: format!("Failed to open file: {}", e),
@@ -250,8 +415,8 @@ pub fn decode_stereo(path: &Path) -> Result<StereoBuffer> {
     let track_id = track.id;
     let codec_params = track.codec_params.clone();
 
-    let source_sample_rate = codec_params.sample_rate.unwrap_or(44100);
-    let channels = codec_params.channels.map(|c| c.count()).unwrap_or(2);
+    let source_sample_rate = codec_params.sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE);
+    let channels = codec_params.channels.map(|c| c.count()).unwrap_or(DEFAULT_CHANNELS);
 
     debug!(
         "Decoding stereo: {} @ {}Hz, {} channels",
@@ -350,6 +515,9 @@ pub fn decode_stereo(path: &Path) -> Result<StereoBuffer> {
 
 /// Downmix multi-channel audio to stereo
 fn downmix_to_stereo(samples: &[f32], channels: usize) -> Vec<f32> {
+    if channels == 0 {
+        return Vec::new();
+    }
     if channels <= 2 {
         return samples.to_vec();
     }
@@ -359,11 +527,11 @@ fn downmix_to_stereo(samples: &[f32], channels: usize) -> Vec<f32> {
     let mut stereo = Vec::with_capacity(num_frames * 2);
 
     for frame in samples.chunks(channels) {
-        // Average odd indices for left, even for right (or vice versa)
+        // Use safe accessors to avoid out-of-bounds on incomplete final frames
         // For 5.1 surround: FL, FR, FC, LFE, BL, BR
         // Simple approach: mix front channels
-        let left = if channels >= 1 { frame[0] } else { 0.0 };
-        let right = if channels >= 2 { frame[1] } else { left };
+        let left = frame.first().copied().unwrap_or(0.0);
+        let right = frame.get(1).copied().unwrap_or(left);
 
         stereo.push(left);
         stereo.push(right);
@@ -406,5 +574,111 @@ mod tests {
         let result = resample(&samples, 44100, 22050);
         // Should be approximately half the length
         assert!((result.len() as f64 - 500.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn test_resample_upsample() {
+        // Test upsampling from 22050 to 44100
+        let samples: Vec<f32> = (0..1000).map(|i| i as f32 / 1000.0).collect();
+        let result = resample(&samples, 22050, 44100);
+        // Should be approximately double the length
+        assert!((result.len() as f64 - 2000.0).abs() < 10.0);
+    }
+
+    #[test]
+    fn test_resample_sine_wave_integrity() {
+        // Generate a 440Hz sine wave at 44100Hz (100 samples = ~2.27 cycles)
+        use std::f32::consts::PI;
+        let sample_rate = 44100.0;
+        let freq = 440.0;
+        let num_samples = 2000;
+        let samples: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * PI * freq * i as f32 / sample_rate).sin())
+            .collect();
+
+        // Downsample to 22050Hz
+        let result = resample(&samples, 44100, 22050);
+
+        // The resampled signal should still oscillate between -1 and 1
+        let max_val = result.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let min_val = result.iter().cloned().fold(f32::INFINITY, f32::min);
+
+        // High-quality resampler should preserve amplitude reasonably well
+        assert!(max_val > 0.9, "Max value {} should be > 0.9", max_val);
+        assert!(min_val < -0.9, "Min value {} should be < -0.9", min_val);
+    }
+
+    #[test]
+    fn test_resample_fallback_works() {
+        // Test the linear fallback directly
+        let samples: Vec<f32> = (0..100).map(|i| i as f32 / 100.0).collect();
+        let result = resample_linear_fallback(&samples, 44100, 22050);
+        assert!((result.len() as f64 - 50.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn test_to_mono_zero_channels() {
+        // Zero channels should return empty vec (not panic)
+        let samples = vec![0.5, 0.8, 1.0];
+        let result = to_mono(&samples, 0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_to_mono_incomplete_frame() {
+        // Incomplete frame at end should be handled gracefully
+        let samples = vec![0.5, 0.3, 0.8, 0.2, 0.7]; // 5 samples, 2 channels = incomplete last frame
+        let result = to_mono(&samples, 2);
+        assert_eq!(result.len(), 3); // 2 complete frames + 1 incomplete
+        assert!((result[0] - 0.4).abs() < 0.001);
+        assert!((result[1] - 0.5).abs() < 0.001);
+        assert!((result[2] - 0.7).abs() < 0.001); // Single sample in last frame
+    }
+
+    #[test]
+    fn test_to_mono_empty_input() {
+        let result = to_mono(&[], 2);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_downmix_to_stereo_zero_channels() {
+        // Zero channels should return empty vec (not panic)
+        let samples = vec![0.5, 0.8, 1.0];
+        let result = downmix_to_stereo(&samples, 0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_downmix_to_stereo_incomplete_frame() {
+        // 6-channel audio with incomplete last frame
+        let samples = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]; // 8 samples, 6 channels
+        let result = downmix_to_stereo(&samples, 6);
+        // First complete frame: left=0.1, right=0.2
+        assert_eq!(result.len(), 4); // 1 complete frame + 1 incomplete
+        assert!((result[0] - 0.1).abs() < 0.001);
+        assert!((result[1] - 0.2).abs() < 0.001);
+        // Incomplete frame: only 2 samples [0.7, 0.8]
+        assert!((result[2] - 0.7).abs() < 0.001);
+        assert!((result[3] - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_downmix_to_stereo_surround() {
+        // 6-channel (5.1) surround: FL, FR, FC, LFE, BL, BR
+        let frame = vec![0.5, 0.3, 0.1, 0.0, 0.2, 0.4];
+        let result = downmix_to_stereo(&frame, 6);
+        assert_eq!(result.len(), 2);
+        // Should extract FL and FR
+        assert!((result[0] - 0.5).abs() < 0.001);
+        assert!((result[1] - 0.3).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_downmix_to_stereo_passthrough() {
+        // 2 channels should pass through unchanged
+        let samples = vec![0.5, 0.3, 0.8, 0.2];
+        let result = downmix_to_stereo(&samples, 2);
+        assert_eq!(result, samples);
     }
 }
