@@ -85,19 +85,19 @@ fn write_track<W: std::io::Write>(
     elem.push_attribute((attrs::TRACK_ID, track.track_id.to_string().as_str()));
 
     // Name (from metadata or filename)
-    let name = track
-        .metadata
-        .title
-        .clone()
-        .unwrap_or_else(|| {
+    // Use as_deref() to avoid cloning when title exists
+    let name: std::borrow::Cow<str> = match track.metadata.title.as_deref() {
+        Some(title) => std::borrow::Cow::Borrowed(title),
+        None => std::borrow::Cow::Owned(
             track
                 .path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("Unknown")
-                .to_string()
-        });
-    elem.push_attribute((attrs::NAME, name.as_str()));
+                .to_string(),
+        ),
+    };
+    elem.push_attribute((attrs::NAME, name.as_ref()));
 
     // Artist
     if let Some(ref artist) = track.metadata.artist {
@@ -205,9 +205,15 @@ fn write_playlists<W: std::io::Write>(
     Ok(())
 }
 
+/// Convert I/O errors during XML writing to DjprepError
+///
+/// Note: `Writer::write_event` returns `io::Result<()>` when the underlying
+/// writer is `BufWriter<File>`, so we receive `std::io::Error` here rather
+/// than `quick_xml::Error`. This is intentional - the quick_xml Writer
+/// propagates I/O errors directly from the underlying writer.
 fn write_error(path: &Path, e: std::io::Error) -> DjprepError {
     DjprepError::OutputError {
         path: path.to_path_buf(),
-        reason: e.to_string(),
+        reason: format!("XML write error: {}", e),
     }
 }

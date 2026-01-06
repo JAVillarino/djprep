@@ -169,65 +169,94 @@ pub fn chunk_audio(audio: &StereoBuffer, config: &ChunkConfig) -> Vec<AudioChunk
     chunks
 }
 
-/// Reassemble separated stem chunks using overlap-add with linear crossfade
-pub fn overlap_add(chunks: &[StemChunk], config: &ChunkConfig, total_samples: usize) -> FourStems {
-    // Initialize output buffers
-    let mut vocals_left = vec![0.0f32; total_samples];
-    let mut vocals_right = vec![0.0f32; total_samples];
-    let mut drums_left = vec![0.0f32; total_samples];
-    let mut drums_right = vec![0.0f32; total_samples];
-    let mut bass_left = vec![0.0f32; total_samples];
-    let mut bass_right = vec![0.0f32; total_samples];
-    let mut other_left = vec![0.0f32; total_samples];
-    let mut other_right = vec![0.0f32; total_samples];
+/// Interleaved stereo sample for a single time point across all 4 stems
+/// Using struct-of-arrays would require 8 separate Vec accesses per sample.
+/// This array-of-structs layout keeps all data for one sample in a single cache line.
+#[derive(Clone, Copy, Default)]
+struct StemSample {
+    vocals_l: f32,
+    vocals_r: f32,
+    drums_l: f32,
+    drums_r: f32,
+    bass_l: f32,
+    bass_r: f32,
+    other_l: f32,
+    other_r: f32,
+}
 
-    // Weight accumulator for normalization
+/// Reassemble separated stem chunks using overlap-add with linear crossfade
+///
+/// Uses array-of-structs layout for better cache locality: all stem data for a single
+/// sample position is stored contiguously, reducing cache misses during the inner loop.
+pub fn overlap_add(chunks: &[StemChunk], config: &ChunkConfig, total_samples: usize) -> FourStems {
+    // Require at least one chunk to determine sample rate
+    let sample_rate = chunks
+        .first()
+        .map(|c| c.vocals.sample_rate)
+        .expect("overlap_add requires at least one chunk");
+
+    // Use array-of-structs for cache locality: all stems for sample i are adjacent
+    let mut output = vec![StemSample::default(); total_samples];
     let mut weight_sum = vec![0.0f32; total_samples];
 
+    let num_chunks = chunks.len();
     for chunk in chunks {
         let chunk_len = chunk.vocals.len();
+        let is_first = chunk.index == 0;
+        let is_last = chunk.index == num_chunks - 1;
 
         // Generate crossfade weights for this chunk
-        let weights = generate_crossfade_weights(chunk_len, config.overlap_samples, chunk.index == 0, chunk.index == chunks.len() - 1);
+        let weights = generate_crossfade_weights(chunk_len, config.overlap_samples, is_first, is_last);
 
-        // Add weighted samples to output
-        // Note: i is used to index multiple arrays (weights, vocals, drums, etc.)
+        // Process samples with good cache locality
+        // The cache benefit comes from StemSample struct keeping all stem data for
+        // one position adjacent in memory. Using indexed loop is clearer than deeply
+        // nested zip iterators and equally efficient with bounds check elision.
+        // We deliberately use indexed loop here rather than iterator-based approach
+        // because we index into 10 different arrays (weights, 8 stem channels, output).
         #[allow(clippy::needless_range_loop)]
         for i in 0..chunk_len {
             let out_idx = chunk.start_sample + i;
             if out_idx < total_samples {
                 let w = weights[i];
+                let s = &mut output[out_idx];
 
-                vocals_left[out_idx] += chunk.vocals.left[i] * w;
-                vocals_right[out_idx] += chunk.vocals.right[i] * w;
-                drums_left[out_idx] += chunk.drums.left[i] * w;
-                drums_right[out_idx] += chunk.drums.right[i] * w;
-                bass_left[out_idx] += chunk.bass.left[i] * w;
-                bass_right[out_idx] += chunk.bass.right[i] * w;
-                other_left[out_idx] += chunk.other.left[i] * w;
-                other_right[out_idx] += chunk.other.right[i] * w;
-
+                // All stem reads for position i are close in the source data,
+                // and all writes go to the same StemSample struct (one cache line)
+                s.vocals_l += chunk.vocals.left[i] * w;
+                s.vocals_r += chunk.vocals.right[i] * w;
+                s.drums_l += chunk.drums.left[i] * w;
+                s.drums_r += chunk.drums.right[i] * w;
+                s.bass_l += chunk.bass.left[i] * w;
+                s.bass_r += chunk.bass.right[i] * w;
+                s.other_l += chunk.other.left[i] * w;
+                s.other_r += chunk.other.right[i] * w;
                 weight_sum[out_idx] += w;
             }
         }
     }
 
-    // Normalize by weight sum
-    for i in 0..total_samples {
-        if weight_sum[i] > 1e-8 {
-            let inv_w = 1.0 / weight_sum[i];
-            vocals_left[i] *= inv_w;
-            vocals_right[i] *= inv_w;
-            drums_left[i] *= inv_w;
-            drums_right[i] *= inv_w;
-            bass_left[i] *= inv_w;
-            bass_right[i] *= inv_w;
-            other_left[i] *= inv_w;
-            other_right[i] *= inv_w;
-        }
-    }
+    // Normalize by weight sum and extract to separate buffers
+    let mut vocals_left = Vec::with_capacity(total_samples);
+    let mut vocals_right = Vec::with_capacity(total_samples);
+    let mut drums_left = Vec::with_capacity(total_samples);
+    let mut drums_right = Vec::with_capacity(total_samples);
+    let mut bass_left = Vec::with_capacity(total_samples);
+    let mut bass_right = Vec::with_capacity(total_samples);
+    let mut other_left = Vec::with_capacity(total_samples);
+    let mut other_right = Vec::with_capacity(total_samples);
 
-    let sample_rate = chunks.first().map(|c| c.vocals.sample_rate).unwrap_or(44100);
+    for (s, &ws) in output.iter().zip(&weight_sum) {
+        let inv_w = if ws > 1e-8 { 1.0 / ws } else { 1.0 };
+        vocals_left.push(s.vocals_l * inv_w);
+        vocals_right.push(s.vocals_r * inv_w);
+        drums_left.push(s.drums_l * inv_w);
+        drums_right.push(s.drums_r * inv_w);
+        bass_left.push(s.bass_l * inv_w);
+        bass_right.push(s.bass_r * inv_w);
+        other_left.push(s.other_l * inv_w);
+        other_right.push(s.other_r * inv_w);
+    }
 
     FourStems {
         vocals: StereoBuffer::new(vocals_left, vocals_right, sample_rate),
@@ -331,5 +360,61 @@ mod tests {
         // Last chunk: fade in, no fade out
         assert!(weights[0] < 0.1);
         assert!(weights[99] > 0.99);
+    }
+
+    #[test]
+    fn test_overlap_add_single_chunk() {
+        // Test overlap_add with a single chunk (no overlap needed)
+        let config = ChunkConfig::new(1.0, 0.1, 44100);
+        let chunk_len = 1000;
+
+        let chunk = StemChunk {
+            index: 0,
+            start_sample: 0,
+            end_sample: chunk_len,
+            vocals: StereoBuffer::new(vec![1.0; chunk_len], vec![0.5; chunk_len], 44100),
+            drums: StereoBuffer::new(vec![0.8; chunk_len], vec![0.4; chunk_len], 44100),
+            bass: StereoBuffer::new(vec![0.6; chunk_len], vec![0.3; chunk_len], 44100),
+            other: StereoBuffer::new(vec![0.2; chunk_len], vec![0.1; chunk_len], 44100),
+        };
+
+        let result = overlap_add(&[chunk], &config, chunk_len);
+
+        // With single chunk, values should be unchanged
+        assert_eq!(result.vocals.left.len(), chunk_len);
+        assert!((result.vocals.left[500] - 1.0).abs() < 0.01);
+        assert!((result.vocals.right[500] - 0.5).abs() < 0.01);
+        assert!((result.drums.left[500] - 0.8).abs() < 0.01);
+        assert!((result.bass.left[500] - 0.6).abs() < 0.01);
+        assert!((result.other.left[500] - 0.2).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_overlap_add_preserves_sample_rate() {
+        let config = ChunkConfig::new(1.0, 0.1, 48000);
+        let chunk_len = 100;
+
+        let chunk = StemChunk {
+            index: 0,
+            start_sample: 0,
+            end_sample: chunk_len,
+            vocals: StereoBuffer::new(vec![0.0; chunk_len], vec![0.0; chunk_len], 48000),
+            drums: StereoBuffer::new(vec![0.0; chunk_len], vec![0.0; chunk_len], 48000),
+            bass: StereoBuffer::new(vec![0.0; chunk_len], vec![0.0; chunk_len], 48000),
+            other: StereoBuffer::new(vec![0.0; chunk_len], vec![0.0; chunk_len], 48000),
+        };
+
+        let result = overlap_add(&[chunk], &config, chunk_len);
+
+        // Sample rate should be preserved from chunks
+        assert_eq!(result.vocals.sample_rate, 48000);
+        assert_eq!(result.drums.sample_rate, 48000);
+    }
+
+    #[test]
+    #[should_panic(expected = "overlap_add requires at least one chunk")]
+    fn test_overlap_add_empty_chunks_panics() {
+        let config = ChunkConfig::htdemucs();
+        let _ = overlap_add(&[], &config, 1000);
     }
 }

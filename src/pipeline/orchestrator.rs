@@ -307,9 +307,14 @@ fn analyze_files(
     };
 
     // Set up stem worker thread if stem separation is enabled
+    // Channel capacity of 4 provides backpressure: when the GPU stem worker is busy,
+    // analysis threads will block on send(), naturally throttling CPU work to match
+    // GPU throughput. Capacity chosen to allow some buffering without excessive memory
+    // use (~4 chunks × ~7.8s × 44.1kHz × 2ch × 4bytes ≈ 11MB peak buffer).
+    const STEM_CHANNEL_CAPACITY: usize = 4;
     let (stem_tx, stem_rx): (Option<Sender<StemJob>>, Option<Receiver<StemJob>>) =
         if stem_separator.is_some() {
-            let (tx, rx) = bounded::<StemJob>(4); // Bounded channel with capacity 4
+            let (tx, rx) = bounded::<StemJob>(STEM_CHANNEL_CAPACITY);
             (Some(tx), Some(rx))
         } else {
             (None, None)
@@ -317,7 +322,7 @@ fn analyze_files(
 
     let (result_tx, result_rx): (Option<Sender<StemResult>>, Option<Receiver<StemResult>>) =
         if stem_separator.is_some() {
-            let (tx, rx) = bounded::<StemResult>(4);
+            let (tx, rx) = bounded::<StemResult>(STEM_CHANNEL_CAPACITY);
             (Some(tx), Some(rx))
         } else {
             (None, None)
@@ -372,7 +377,9 @@ fn analyze_files(
                             input_path: file.path.clone(),
                             output_dir: stems_dir.clone(),
                         };
-                        // Non-blocking send - if channel is full, we'll wait (backpressure)
+                        // Blocking send - when channel is full, this blocks until the stem
+                        // worker consumes a job. This provides natural backpressure to prevent
+                        // analysis from outpacing stem separation.
                         if tx.send(job).is_err() {
                             warn!("Failed to submit stem job for {}", file.path.display());
                         }

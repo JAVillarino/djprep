@@ -19,6 +19,10 @@ indicatif = { version = "0.17", features = ["rayon"] }
 # Audio decoding
 symphonia = { version = "0.5", features = ["mp3", "flac", "wav", "aiff", "pcm"] }
 
+# High-quality audio resampling with anti-aliasing
+# Prevents aliasing artifacts when downsampling (e.g., 44.1kHz -> 22kHz for analysis)
+rubato = "0.16"
+
 # Metadata extraction
 lofty = "0.18"
 

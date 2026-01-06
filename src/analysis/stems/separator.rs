@@ -283,13 +283,17 @@ impl OrtStemSeparator {
             debug!("Processing chunk {}/{}", i + 1, chunks.len());
 
             // Prepare input tensor: shape (batch=1, channels=2, samples)
+            // Use slice assignment instead of element-by-element for efficiency
             let chunk_len = chunk.audio.len();
             let mut input_data = Array3::<f32>::zeros((1, 2, chunk_len));
 
-            for j in 0..chunk_len {
-                input_data[[0, 0, j]] = chunk.audio.left[j];
-                input_data[[0, 1, j]] = chunk.audio.right[j];
-            }
+            // Assign entire channel slices at once using ndarray's slice_mut
+            input_data
+                .slice_mut(ndarray::s![0, 0, ..])
+                .assign(&ndarray::ArrayView1::from(&chunk.audio.left));
+            input_data
+                .slice_mut(ndarray::s![0, 1, ..])
+                .assign(&ndarray::ArrayView1::from(&chunk.audio.right));
 
             // Create input tensor (ort 2.0 needs owned array)
             let input_tensor = Tensor::from_array(input_data)
@@ -297,12 +301,11 @@ impl OrtStemSeparator {
                     reason: format!("Failed to create input tensor: {}", e),
                 })?;
 
-            // Get input name from session
-            let input_name = session
-                .inputs
-                .first()
-                .map(|i| i.name.clone())
-                .unwrap_or_else(|| "input".to_string());
+            // Get input name from session - fail explicitly if model has no inputs
+            let input_info = session.inputs.first().ok_or_else(|| DjprepError::StemUnavailable {
+                reason: "Model has no input tensors defined".to_string(),
+            })?;
+            let input_name = input_info.name.clone();
 
             // Run inference
             let inputs = ort::inputs![input_name.as_str() => input_tensor];
@@ -330,7 +333,7 @@ impl OrtStemSeparator {
 
             let shape: Vec<i64> = output_shape.iter().copied().collect();
 
-            // Validate output shape
+            // Validate output shape: expect (batch=1, stems=4, channels=2, samples)
             if shape.len() != 4 || shape[1] != 4 || shape[2] != 2 {
                 return Err(DjprepError::StemUnavailable {
                     reason: format!(
@@ -342,23 +345,33 @@ impl OrtStemSeparator {
 
             let output_samples = shape[3] as usize;
             let num_channels = shape[2] as usize;
+            let num_stems = shape[1] as usize;
+
+            // Validate buffer length matches claimed shape
+            // Expected: batch(1) * stems(4) * channels(2) * samples
+            let expected_len = num_stems * num_channels * output_samples;
+            if output_data.len() != expected_len {
+                return Err(DjprepError::StemUnavailable {
+                    reason: format!(
+                        "Output buffer length {} doesn't match shape {:?} (expected {})",
+                        output_data.len(),
+                        shape,
+                        expected_len
+                    ),
+                });
+            }
 
             // Extract stems from flat tensor data
             // Layout: [batch, stems, channels, samples] in row-major order
+            // Pre-calculate offsets outside the inner loop for efficiency
             let extract_stem = |stem_idx: usize| -> StereoBuffer {
-                let mut left = Vec::with_capacity(output_samples);
-                let mut right = Vec::with_capacity(output_samples);
+                let stem_offset = stem_idx * num_channels * output_samples;
+                let left_start = stem_offset;
+                let right_start = stem_offset + output_samples;
 
-                for s in 0..output_samples {
-                    // Calculate flat index for row-major 4D array
-                    // Layout: [stem_idx][channel][sample] where channel 0=left, 1=right
-                    let stem_offset = stem_idx * num_channels * output_samples;
-                    let left_idx = stem_offset + s;
-                    let right_idx = stem_offset + output_samples + s;
-
-                    left.push(output_data[left_idx]);
-                    right.push(output_data[right_idx]);
-                }
+                // Use slice copying instead of element-by-element
+                let left = output_data[left_start..left_start + output_samples].to_vec();
+                let right = output_data[right_start..right_start + output_samples].to_vec();
 
                 StereoBuffer::new(left, right, chunk.audio.sample_rate)
             };

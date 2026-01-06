@@ -1,9 +1,11 @@
 //! Audio decoding using symphonia
 //!
 //! Decodes audio files to mono f32 samples at the target sample rate.
+//! Uses rubato for high-quality resampling with proper anti-aliasing.
 
 use crate::error::{DjprepError, Result};
 use crate::types::{AudioBuffer, StereoBuffer};
+use rubato::{FftFixedInOut, Resampler};
 use std::path::Path;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
@@ -14,7 +16,7 @@ use symphonia::core::probe::Hint;
 use tracing::{debug, trace};
 
 /// Target sample rate for analysis (22050 Hz)
-/// 
+///
 /// This is sufficient for BPM and key detection (frequencies < 11kHz)
 /// while reducing computation by 50% compared to 44.1kHz
 pub const TARGET_SAMPLE_RATE: u32 = 22050;
@@ -176,10 +178,97 @@ fn to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Simple linear interpolation resampler
+/// High-quality audio resampling using rubato
 ///
-/// For production, consider using rubato crate for higher quality
+/// Uses FFT-based resampling with proper anti-aliasing filter to prevent
+/// aliasing artifacts when downsampling. This is critical for accurate
+/// frequency analysis in BPM and key detection.
+///
+/// The resampler uses a sinc interpolation kernel with configurable quality.
+/// For analysis (mono, 22kHz), we use moderate quality settings that balance
+/// accuracy with performance.
 fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if from_rate == to_rate {
+        return samples.to_vec();
+    }
+
+    // Calculate chunk size - rubato works on fixed-size chunks
+    // Use a reasonable chunk size for efficiency
+    const CHUNK_SIZE: usize = 1024;
+
+    // Create resampler with FFT-based algorithm
+    // FftFixedInOut provides good quality with reasonable performance
+    let mut resampler = match FftFixedInOut::<f32>::new(
+        from_rate as usize,
+        to_rate as usize,
+        CHUNK_SIZE,
+        1, // mono channel
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            // Fallback to simple resampling if rubato fails to initialize
+            debug!("Rubato initialization failed ({}), using fallback", e);
+            return resample_linear_fallback(samples, from_rate, to_rate);
+        }
+    };
+
+    let input_frames_per_chunk = resampler.input_frames_next();
+    let output_frames_per_chunk = resampler.output_frames_next();
+
+    // Estimate output size
+    let ratio = to_rate as f64 / from_rate as f64;
+    let estimated_output_len = (samples.len() as f64 * ratio).ceil() as usize;
+    let mut output = Vec::with_capacity(estimated_output_len);
+
+    // Process in chunks
+    let mut pos = 0;
+    while pos < samples.len() {
+        let end = (pos + input_frames_per_chunk).min(samples.len());
+        let mut chunk = samples[pos..end].to_vec();
+
+        // Pad last chunk if needed
+        if chunk.len() < input_frames_per_chunk {
+            chunk.resize(input_frames_per_chunk, 0.0);
+        }
+
+        // Rubato expects Vec<Vec<f32>> for multi-channel, we have mono
+        let input_channels = vec![chunk];
+
+        match resampler.process(&input_channels, None) {
+            Ok(resampled) => {
+                if let Some(channel) = resampled.first() {
+                    // Only take valid samples (not padding)
+                    let valid_samples = if pos + input_frames_per_chunk > samples.len() {
+                        // Last chunk - calculate how many output samples are valid
+                        let input_valid = samples.len() - pos;
+                        let output_valid = (input_valid as f64 * ratio).ceil() as usize;
+                        output_valid.min(output_frames_per_chunk)
+                    } else {
+                        output_frames_per_chunk
+                    };
+                    output.extend_from_slice(&channel[..valid_samples]);
+                }
+            }
+            Err(e) => {
+                debug!("Rubato processing error ({}), using fallback for remaining", e);
+                // Fallback for remaining samples
+                let remaining = resample_linear_fallback(&samples[pos..], from_rate, to_rate);
+                output.extend(remaining);
+                break;
+            }
+        }
+
+        pos += input_frames_per_chunk;
+    }
+
+    output
+}
+
+/// Fallback linear interpolation resampler
+///
+/// Used only when rubato fails to initialize or process. This is a simple
+/// linear interpolation that may introduce aliasing artifacts.
+fn resample_linear_fallback(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == to_rate {
         return samples.to_vec();
     }
@@ -194,7 +283,6 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
         let frac = src_pos - src_idx as f64;
 
         let sample = if src_idx + 1 < samples.len() {
-            // Linear interpolation
             samples[src_idx] * (1.0 - frac as f32) + samples[src_idx + 1] * frac as f32
         } else {
             samples[src_idx.min(samples.len() - 1)]
@@ -406,5 +494,45 @@ mod tests {
         let result = resample(&samples, 44100, 22050);
         // Should be approximately half the length
         assert!((result.len() as f64 - 500.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn test_resample_upsample() {
+        // Test upsampling from 22050 to 44100
+        let samples: Vec<f32> = (0..1000).map(|i| i as f32 / 1000.0).collect();
+        let result = resample(&samples, 22050, 44100);
+        // Should be approximately double the length
+        assert!((result.len() as f64 - 2000.0).abs() < 10.0);
+    }
+
+    #[test]
+    fn test_resample_sine_wave_integrity() {
+        // Generate a 440Hz sine wave at 44100Hz (100 samples = ~2.27 cycles)
+        use std::f32::consts::PI;
+        let sample_rate = 44100.0;
+        let freq = 440.0;
+        let num_samples = 2000;
+        let samples: Vec<f32> = (0..num_samples)
+            .map(|i| (2.0 * PI * freq * i as f32 / sample_rate).sin())
+            .collect();
+
+        // Downsample to 22050Hz
+        let result = resample(&samples, 44100, 22050);
+
+        // The resampled signal should still oscillate between -1 and 1
+        let max_val = result.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let min_val = result.iter().cloned().fold(f32::INFINITY, f32::min);
+
+        // High-quality resampler should preserve amplitude reasonably well
+        assert!(max_val > 0.9, "Max value {} should be > 0.9", max_val);
+        assert!(min_val < -0.9, "Min value {} should be < -0.9", min_val);
+    }
+
+    #[test]
+    fn test_resample_fallback_works() {
+        // Test the linear fallback directly
+        let samples: Vec<f32> = (0..100).map(|i| i as f32 / 100.0).collect();
+        let result = resample_linear_fallback(&samples, 44100, 22050);
+        assert!((result.len() as f64 - 50.0).abs() < 2.0);
     }
 }
