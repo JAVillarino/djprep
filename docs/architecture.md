@@ -1,6 +1,10 @@
-Intial research
-Technical Architecture Report: djprep – High-Performance Audio Analysis & Metadata Interchange System
-1. Executive Summary
+# Technical Architecture Report: djprep
+
+**Repository:** https://github.com/JAVillarino/djprep
+
+*Initial research and design document for djprep – High-Performance Audio Analysis & Metadata Interchange System*
+
+## 1. Executive Summary
 This report presents a comprehensive architectural specification for djprep, a command-line interface (CLI) utility engineered to serve as a high-performance, open-source alternative to proprietary audio analysis tools such as "Mixed In Key." The primary objective of djprep is to perform batch analysis of digital audio files—specifically MP3, WAV, FLAC, and AIFF formats—to extract critical musical metadata including Beats Per Minute (BPM), Musical Key (Tonality), and Stem separation. A crucial requirement of this system is the capability to export this analyzed data into a standardized rekordbox.xml format, facilitating seamless integration with Pioneer DJ’s Rekordbox ecosystem, as well as a generic JSON format for interoperability with other systems.
 The proposed architecture leverages the Rust programming language to prioritize memory safety, thread-level parallelism, and zero-cost abstractions. Central to the design is the utilization of symphonia for pure-Rust audio decoding, rayon for data parallelism, and ort (ONNX Runtime) for deep learning inference required by stem separation. The report conducts a rigorous analysis of the Rekordbox XML schema, identifying critical constraints regarding 32-bit signed integer limits for Track IDs and the idiosyncrasies of URI encoding across Windows and POSIX systems. Furthermore, it addresses the significant challenge of "Octave Errors" in BPM detection through heuristic signal processing strategies and evaluates the trade-offs between Hybrid Transformer Demucs (HTDemucs) and MDX-Net architectures for stem separation. By resolving resource contention between CPU-bound DSP tasks and tensor-based inference, djprep aims to deliver professional-grade analysis speed and accuracy in a portable, single-binary distribution.
 2. Introduction to the Problem Space

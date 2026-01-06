@@ -1,5 +1,7 @@
 # djprep - Claude Code Implementation Guide
 
+**Repository:** https://github.com/JAVillarino/djprep
+
 ## Project Overview
 
 djprep is a CLI tool that analyzes audio files (MP3, WAV, FLAC, AIFF) to extract BPM, musical key, and optionally separate stems. It outputs Rekordbox-compatible XML for import into Pioneer DJ software, plus a JSON sidecar for interoperability.

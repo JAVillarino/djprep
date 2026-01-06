@@ -381,14 +381,16 @@ Contributions welcome! Areas that could use help:
 - **Platform testing:** Windows and Linux validation
 - **Documentation:** More usage examples
 
+**Report bugs or request features:** [GitHub Issues](https://github.com/JAVillarino/djprep/issues)
+
 ### How to Contribute
 
-1. Fork the repository
+1. Fork the [repository](https://github.com/JAVillarino/djprep)
 2. Create a feature branch: `git checkout -b feature/my-feature`
 3. Make your changes and ensure tests pass: `cargo test`
 4. Check for issues: `cargo clippy`
 5. Format code: `cargo fmt`
-6. Submit a pull request
+6. Submit a [pull request](https://github.com/JAVillarino/djprep/pulls)
 
 ### Running Tests
 
