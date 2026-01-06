@@ -333,11 +333,42 @@ impl OrtStemSeparator {
 
             let shape: Vec<i64> = output_shape.iter().copied().collect();
 
-            // Validate output shape: expect (batch=1, stems=4, channels=2, samples)
-            if shape.len() != 4 || shape[1] != 4 || shape[2] != 2 {
+            // Validate output shape: expect exactly (batch=1, stems=4, channels=2, samples)
+            // HTDemucs outputs: [1, 4, 2, num_samples] where 4 = vocals/drums/bass/other
+            if shape.len() != 4 {
                 return Err(DjprepError::StemUnavailable {
                     reason: format!(
-                        "Unexpected output shape {:?}, expected (1, 4, 2, samples)",
+                        "Expected 4D output tensor, got {}D with shape {:?}",
+                        shape.len(),
+                        shape
+                    ),
+                });
+            }
+
+            // Validate each dimension explicitly for clear error messages
+            if shape[0] != 1 {
+                return Err(DjprepError::StemUnavailable {
+                    reason: format!(
+                        "Expected batch size 1, got {} (shape {:?})",
+                        shape[0],
+                        shape
+                    ),
+                });
+            }
+            if shape[1] != 4 {
+                return Err(DjprepError::StemUnavailable {
+                    reason: format!(
+                        "Expected 4 stems (vocals/drums/bass/other), got {} (shape {:?})",
+                        shape[1],
+                        shape
+                    ),
+                });
+            }
+            if shape[2] != 2 {
+                return Err(DjprepError::StemUnavailable {
+                    reason: format!(
+                        "Expected 2 channels (stereo), got {} (shape {:?})",
+                        shape[2],
                         shape
                     ),
                 });
@@ -348,12 +379,14 @@ impl OrtStemSeparator {
             let num_stems = shape[1] as usize;
 
             // Validate buffer length matches claimed shape
+            // This confirms the tensor is contiguous in memory (C-order/row-major)
             // Expected: batch(1) * stems(4) * channels(2) * samples
             let expected_len = num_stems * num_channels * output_samples;
             if output_data.len() != expected_len {
                 return Err(DjprepError::StemUnavailable {
                     reason: format!(
-                        "Output buffer length {} doesn't match shape {:?} (expected {})",
+                        "Output buffer length {} doesn't match shape {:?} (expected {}). \
+                         Tensor may not be contiguous.",
                         output_data.len(),
                         shape,
                         expected_len
@@ -362,14 +395,20 @@ impl OrtStemSeparator {
             }
 
             // Extract stems from flat tensor data
-            // Layout: [batch, stems, channels, samples] in row-major order
-            // Pre-calculate offsets outside the inner loop for efficiency
+            // ONNX tensors are row-major (C-order): [batch, stems, channels, samples]
+            // For shape [1, 4, 2, N], flat layout is:
+            //   stem0_left[0..N], stem0_right[N..2N],
+            //   stem1_left[2N..3N], stem1_right[3N..4N], ...
+            // We verified contiguity above via length check.
             let extract_stem = |stem_idx: usize| -> StereoBuffer {
                 let stem_offset = stem_idx * num_channels * output_samples;
                 let left_start = stem_offset;
                 let right_start = stem_offset + output_samples;
 
-                // Use slice copying instead of element-by-element
+                // Bounds are guaranteed by shape validation above, but let's be explicit
+                debug_assert!(left_start + output_samples <= output_data.len());
+                debug_assert!(right_start + output_samples <= output_data.len());
+
                 let left = output_data[left_start..left_start + output_samples].to_vec();
                 let right = output_data[right_start..right_start + output_samples].to_vec();
 

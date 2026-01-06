@@ -246,7 +246,9 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
                     } else {
                         output_frames_per_chunk
                     };
-                    output.extend_from_slice(&channel[..valid_samples]);
+                    // Guard against floating-point rounding causing out-of-bounds
+                    let safe_samples = valid_samples.min(channel.len());
+                    output.extend_from_slice(&channel[..safe_samples]);
                 }
             }
             Err(e) => {

@@ -13,7 +13,7 @@ use crate::discovery::{self, DiscoveredFile};
 use crate::error::{DjprepError, Result};
 use crate::export;
 use crate::types::{AnalyzedTrack, StemPaths};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::path::PathBuf;
@@ -320,9 +320,14 @@ fn analyze_files(
             (None, None)
         };
 
+    // Result channel is UNBOUNDED to prevent deadlock:
+    // The stem worker sends results while main thread waits on join().
+    // If result channel were bounded, the worker could block on send() while
+    // main thread blocks on join(), causing deadlock. Unbounded channel allows
+    // worker to complete all sends before main thread drains results.
     let (result_tx, result_rx): (Option<Sender<StemResult>>, Option<Receiver<StemResult>>) =
         if stem_separator.is_some() {
-            let (tx, rx) = bounded::<StemResult>(STEM_CHANNEL_CAPACITY);
+            let (tx, rx) = unbounded::<StemResult>();
             (Some(tx), Some(rx))
         } else {
             (None, None)
