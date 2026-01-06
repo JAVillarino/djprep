@@ -1,0 +1,81 @@
+[package]
+name = "djprep"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "High-performance audio analysis for DJs - BPM, Key, and Stem separation"
+license = "MIT"
+repository = "https://github.com/JAVillarino/djprep"
+
+[features]
+default = []
+stems = ["dep:ort", "dep:reqwest", "dep:sha2", "dep:hex", "dep:rustfft", "dep:ndarray"]
+
+[dependencies]
+# CLI & UX
+clap = { version = "4", features = ["derive"] }
+indicatif = { version = "0.17", features = ["rayon"] }
+
+# Audio decoding
+symphonia = { version = "0.5", features = ["mp3", "flac", "wav", "aiff", "pcm"] }
+
+# Metadata extraction
+lofty = "0.18"
+
+# Analysis backends
+# stratum-dsp is a pure-Rust library for DJ audio analysis
+# Provides BPM detection, key detection, and beat tracking
+stratum-dsp = "1.0"
+
+# ML Inference (optional, for stem separation)
+# Using latest ort 2.0 RC for ONNX Runtime
+ort = { version = "2.0.0-rc.10", optional = true }
+
+# Concurrency
+rayon = "1.10"
+crossbeam-channel = "0.5"
+num_cpus = "1.16"
+
+# Serialization
+quick-xml = { version = "0.37", features = ["serialize"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utilities
+thiserror = "2"
+anyhow = "1"
+walkdir = "2"
+percent-encoding = "2"
+chrono = { version = "0.4", features = ["serde"] }
+directories = "5"
+hash32 = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Audio writing (for stems)
+hound = "3.5"
+
+# Model download (optional, for stems)
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false, optional = true }
+sha2 = { version = "0.10", optional = true }
+hex = { version = "0.4", optional = true }
+
+# FFT for STFT preprocessing (optional, for stems)
+rustfft = { version = "6.2", optional = true }
+
+# Array/tensor operations for ORT inference (optional, for stems)
+ndarray = { version = "0.16", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1
+
+[profile.dev]
+# Faster builds during development
+opt-level = 0
+debug = true

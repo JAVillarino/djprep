@@ -1,0 +1,30 @@
+# Rust
+/target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test outputs
+/test-output/
+*.wav
+*.mp3
+*.flac
+*.aiff
+*.aif
+
+# Model files (too large for git)
+*.onnx
+models/
+
+# Temporary files
+*.tmp
+*.temp
