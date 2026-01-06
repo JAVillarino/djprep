@@ -374,6 +374,17 @@ impl OrtStemSeparator {
                 });
             }
 
+            // Validate ONNX dimensions are positive before casting to usize
+            // Negative dimensions would wrap to huge values and cause OOM or panic
+            if shape[1] < 0 || shape[2] < 0 || shape[3] < 0 {
+                return Err(DjprepError::StemUnavailable {
+                    reason: format!(
+                        "Invalid negative dimension in ONNX output shape {:?}",
+                        shape
+                    ),
+                });
+            }
+
             let output_samples = shape[3] as usize;
             let num_channels = shape[2] as usize;
             let num_stems = shape[1] as usize;
@@ -381,7 +392,17 @@ impl OrtStemSeparator {
             // Validate buffer length matches claimed shape
             // This confirms the tensor is contiguous in memory (C-order/row-major)
             // Expected: batch(1) * stems(4) * channels(2) * samples
-            let expected_len = num_stems * num_channels * output_samples;
+            // Use checked arithmetic to prevent overflow
+            let expected_len = num_stems
+                .checked_mul(num_channels)
+                .and_then(|v| v.checked_mul(output_samples))
+                .ok_or_else(|| DjprepError::StemUnavailable {
+                    reason: format!(
+                        "ONNX shape {:?} would overflow memory calculation",
+                        shape
+                    ),
+                })?;
+
             if output_data.len() != expected_len {
                 return Err(DjprepError::StemUnavailable {
                     reason: format!(
@@ -401,13 +422,21 @@ impl OrtStemSeparator {
             //   stem1_left[2N..3N], stem1_right[3N..4N], ...
             // We verified contiguity above via length check.
             let extract_stem = |stem_idx: usize| -> StereoBuffer {
-                let stem_offset = stem_idx * num_channels * output_samples;
+                // Use checked arithmetic to prevent overflow
+                let stem_offset = stem_idx.saturating_mul(num_channels).saturating_mul(output_samples);
                 let left_start = stem_offset;
-                let right_start = stem_offset + output_samples;
+                let right_start = stem_offset.saturating_add(output_samples);
 
-                // Bounds are guaranteed by shape validation above, but let's be explicit
-                debug_assert!(left_start + output_samples <= output_data.len());
-                debug_assert!(right_start + output_samples <= output_data.len());
+                // Use assert! not debug_assert! - these checks must run in release builds
+                // to prevent out-of-bounds access from corrupted model output
+                assert!(
+                    left_start.saturating_add(output_samples) <= output_data.len(),
+                    "Left channel bounds check failed"
+                );
+                assert!(
+                    right_start.saturating_add(output_samples) <= output_data.len(),
+                    "Right channel bounds check failed"
+                );
 
                 let left = output_data[left_start..left_start + output_samples].to_vec();
                 let right = output_data[right_start..right_start + output_samples].to_vec();

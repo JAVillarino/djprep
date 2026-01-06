@@ -40,10 +40,14 @@ pub fn scan(input: &Path, recursive: bool) -> Result<Vec<DiscoveredFile>> {
         }
     } else if input.is_dir() {
         // Directory mode
+        // Disable symlink following for security:
+        // - Prevents accidental analysis of files outside target directory
+        // - Avoids potential infinite loops from circular symlinks
+        // - Protects against symlink attacks in untrusted directories
         let walker = if recursive {
-            WalkDir::new(input)
+            WalkDir::new(input).follow_links(false)
         } else {
-            WalkDir::new(input).max_depth(1)
+            WalkDir::new(input).max_depth(1).follow_links(false)
         };
 
         for entry in walker.into_iter().filter_map(|e| e.ok()) {

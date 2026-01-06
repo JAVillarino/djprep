@@ -151,12 +151,20 @@ fn write_track<W: std::io::Write>(
     let location = path_to_rekordbox_uri(&track.path);
     elem.push_attribute((attrs::LOCATION, location.as_str()));
 
-    // Duration
-    let total_time = track.duration_seconds.round() as i64;
+    // Duration - guard against NaN/Inf which would cause undefined behavior in cast
+    let total_time = if track.duration_seconds.is_finite() && track.duration_seconds >= 0.0 {
+        track.duration_seconds.round().min(i64::MAX as f64) as i64
+    } else {
+        0 // Use 0 for invalid duration
+    };
     elem.push_attribute((attrs::TOTAL_TIME, total_time.to_string().as_str()));
 
-    // BPM (2 decimal places)
-    let bpm = format!("{:.2}", track.bpm.value);
+    // BPM (2 decimal places) - guard against NaN/Inf for valid XML
+    let bpm = if track.bpm.value.is_finite() && track.bpm.value > 0.0 {
+        format!("{:.2}", track.bpm.value.clamp(1.0, 999.99))
+    } else {
+        "120.00".to_string() // Reasonable default for invalid BPM
+    };
     elem.push_attribute((attrs::AVERAGE_BPM, bpm.as_str()));
 
     // Key (Camelot notation)
@@ -169,11 +177,20 @@ fn write_track<W: std::io::Write>(
     // Sample rate
     elem.push_attribute((attrs::SAMPLE_RATE, track.sample_rate.to_string().as_str()));
 
-    // Comments (include analysis confidence info)
+    // Comments (include analysis confidence info) - clamp confidence to valid range
+    let bpm_conf = if track.bpm.confidence.is_finite() {
+        (track.bpm.confidence * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    let key_conf = if track.key.confidence.is_finite() {
+        (track.key.confidence * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
     let comment = format!(
         "djprep: BPM conf={:.0}%, Key conf={:.0}%",
-        track.bpm.confidence * 100.0,
-        track.key.confidence * 100.0
+        bpm_conf, key_conf
     );
     elem.push_attribute((attrs::COMMENTS, comment.as_str()));
 

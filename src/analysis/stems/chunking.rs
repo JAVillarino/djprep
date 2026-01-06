@@ -144,7 +144,8 @@ pub fn chunk_audio(audio: &StereoBuffer, config: &ChunkConfig) -> Vec<AudioChunk
     let mut index = 0;
 
     while start < total_samples {
-        let end = (start + config.chunk_samples).min(total_samples);
+        // Use saturating arithmetic to prevent overflow
+        let end = start.saturating_add(config.chunk_samples).min(total_samples);
 
         // Extract chunk samples
         let left: Vec<f32> = audio.left[start..end].to_vec();
@@ -157,12 +158,17 @@ pub fn chunk_audio(audio: &StereoBuffer, config: &ChunkConfig) -> Vec<AudioChunk
             audio: StereoBuffer::new(left, right, config.sample_rate),
         });
 
-        // Move to next chunk
-        start += stride;
+        // Move to next chunk (saturating to prevent overflow)
+        start = start.saturating_add(stride);
         index += 1;
 
-        // Avoid tiny final chunk
-        if total_samples - start < config.overlap_samples {
+        // Avoid tiny final chunk - use checked subtraction to prevent underflow
+        // If start >= total_samples, we've processed everything
+        if start >= total_samples {
+            break;
+        }
+        let remaining = total_samples - start; // Safe: start < total_samples
+        if remaining < config.overlap_samples {
             break;
         }
     }
@@ -210,10 +216,22 @@ pub fn overlap_add(chunks: &[StemChunk], config: &ChunkConfig, total_samples: us
     for chunk in chunks {
         let chunk_len = chunk.vocals.len();
         let is_first = chunk.index == 0;
-        let is_last = chunk.index == num_chunks - 1;
+        // Safe: num_chunks >= 1 (we checked for empty chunks above)
+        let is_last = chunk.index == num_chunks.saturating_sub(1);
 
         // Generate crossfade weights for this chunk
         let weights = generate_crossfade_weights(chunk_len, config.overlap_samples, is_first, is_last);
+
+        // Validate chunk buffers match expected length to prevent index out of bounds
+        if chunk.vocals.left.len() < chunk_len
+            || chunk.drums.left.len() < chunk_len
+            || chunk.bass.left.len() < chunk_len
+            || chunk.other.left.len() < chunk_len
+        {
+            return Err(DjprepError::StemUnavailable {
+                reason: "Chunk buffer length mismatch in overlap_add".to_string(),
+            });
+        }
 
         // Process samples with good cache locality
         // The cache benefit comes from StemSample struct keeping all stem data for
@@ -223,7 +241,8 @@ pub fn overlap_add(chunks: &[StemChunk], config: &ChunkConfig, total_samples: us
         // because we index into 10 different arrays (weights, 8 stem channels, output).
         #[allow(clippy::needless_range_loop)]
         for i in 0..chunk_len {
-            let out_idx = chunk.start_sample + i;
+            // Use saturating_add to prevent overflow
+            let out_idx = chunk.start_sample.saturating_add(i);
             if out_idx < total_samples {
                 let w = weights[i];
                 let s = &mut output[out_idx];
@@ -282,22 +301,34 @@ fn generate_crossfade_weights(
     is_first: bool,
     is_last: bool,
 ) -> Vec<f32> {
+    // Handle edge case: empty chunk
+    if chunk_len == 0 {
+        return Vec::new();
+    }
+
     let mut weights = vec![1.0f32; chunk_len];
 
     // Fade in at start (unless first chunk)
     if !is_first {
         let fade_len = overlap.min(chunk_len);
-        for (i, weight) in weights.iter_mut().take(fade_len).enumerate() {
-            *weight = i as f32 / fade_len as f32;
+        // Guard against division by zero
+        if fade_len > 0 {
+            for (i, weight) in weights.iter_mut().take(fade_len).enumerate() {
+                *weight = i as f32 / fade_len as f32;
+            }
         }
     }
 
     // Fade out at end (unless last chunk)
     if !is_last {
         let fade_len = overlap.min(chunk_len);
-        let start = chunk_len.saturating_sub(fade_len);
-        for (i, weight) in weights[start..].iter_mut().enumerate() {
-            *weight *= (fade_len - i) as f32 / fade_len as f32;
+        // Guard against division by zero
+        if fade_len > 0 {
+            let start = chunk_len.saturating_sub(fade_len);
+            for (i, weight) in weights[start..].iter_mut().enumerate() {
+                // Safe: fade_len > i because we iterate over fade_len elements
+                *weight *= (fade_len - i) as f32 / fade_len as f32;
+            }
         }
     }
 

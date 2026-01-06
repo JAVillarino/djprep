@@ -237,6 +237,10 @@ pub fn compute_istft(spectrogram: &StereoSpectrogram, output_length: usize) -> S
 #[cfg(feature = "stems")]
 fn hann_window(size: usize) -> Vec<f32> {
     use std::f32::consts::PI;
+    // Handle edge case: zero size would cause division by zero
+    if size == 0 {
+        return Vec::new();
+    }
     (0..size)
         .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / size as f32).cos()))
         .collect()

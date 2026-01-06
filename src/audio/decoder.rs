@@ -199,6 +199,15 @@ fn to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
 /// For analysis (mono, 22kHz), we use moderate quality settings that balance
 /// accuracy with performance.
 fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    // Handle edge cases that would cause division by zero or incorrect behavior
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    if from_rate == 0 || to_rate == 0 {
+        // Invalid sample rates - return original samples rather than panic
+        debug!("Invalid sample rate (from={}, to={}), skipping resample", from_rate, to_rate);
+        return samples.to_vec();
+    }
     if from_rate == to_rate {
         return samples.to_vec();
     }
@@ -226,15 +235,22 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     let input_frames_per_chunk = resampler.input_frames_next();
     let output_frames_per_chunk = resampler.output_frames_next();
 
-    // Estimate output size
+    // Validate rubato returned valid frame counts
+    if input_frames_per_chunk == 0 || output_frames_per_chunk == 0 {
+        debug!("Rubato returned zero frame count, using fallback");
+        return resample_linear_fallback(samples, from_rate, to_rate);
+    }
+
+    // Estimate output size with overflow protection
     let ratio = to_rate as f64 / from_rate as f64;
-    let estimated_output_len = (samples.len() as f64 * ratio).ceil() as usize;
+    let estimated_output_len = ((samples.len() as f64 * ratio).ceil() as usize)
+        .min(samples.len().saturating_mul(4)); // Cap at 4x input length as sanity check
     let mut output = Vec::with_capacity(estimated_output_len);
 
-    // Process in chunks
+    // Process in chunks using saturating arithmetic to prevent overflow
     let mut pos = 0;
     while pos < samples.len() {
-        let end = (pos + input_frames_per_chunk).min(samples.len());
+        let end = pos.saturating_add(input_frames_per_chunk).min(samples.len());
         let mut chunk = samples[pos..end].to_vec();
 
         // Pad last chunk if needed
@@ -249,9 +265,9 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
             Ok(resampled) => {
                 if let Some(channel) = resampled.first() {
                     // Only take valid samples (not padding)
-                    let valid_samples = if pos + input_frames_per_chunk > samples.len() {
+                    let valid_samples = if pos.saturating_add(input_frames_per_chunk) > samples.len() {
                         // Last chunk - calculate how many output samples are valid
-                        let input_valid = samples.len() - pos;
+                        let input_valid = samples.len().saturating_sub(pos);
                         let output_valid = (input_valid as f64 * ratio).ceil() as usize;
                         output_valid.min(output_frames_per_chunk)
                     } else {
@@ -271,7 +287,7 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
             }
         }
 
-        pos += input_frames_per_chunk;
+        pos = pos.saturating_add(input_frames_per_chunk);
     }
 
     output
@@ -282,23 +298,48 @@ fn resample(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 /// Used only when rubato fails to initialize or process. This is a simple
 /// linear interpolation that may introduce aliasing artifacts.
 fn resample_linear_fallback(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    // Handle edge cases that would cause division by zero or out-of-bounds access
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    if from_rate == 0 || to_rate == 0 {
+        // Invalid sample rates - return original samples rather than panic
+        return samples.to_vec();
+    }
     if from_rate == to_rate {
         return samples.to_vec();
     }
 
     let ratio = from_rate as f64 / to_rate as f64;
+    // Protect against ratio producing zero or huge output lengths
+    if ratio <= 0.0 || !ratio.is_finite() {
+        return samples.to_vec();
+    }
+
     let output_len = (samples.len() as f64 / ratio) as usize;
+    // Sanity check: output shouldn't be more than 10x input (very generous)
+    let output_len = output_len.min(samples.len().saturating_mul(10));
+    if output_len == 0 {
+        return Vec::new();
+    }
+
     let mut output = Vec::with_capacity(output_len);
 
     for i in 0..output_len {
         let src_pos = i as f64 * ratio;
         let src_idx = src_pos as usize;
-        let frac = src_pos - src_idx as f64;
+        let frac = (src_pos - src_idx as f64) as f32;
 
-        let sample = if src_idx + 1 < samples.len() {
-            samples[src_idx] * (1.0 - frac as f32) + samples[src_idx + 1] * frac as f32
+        // Safe indexing with bounds checking
+        let sample = if src_idx >= samples.len() {
+            // Past end of samples - use last sample
+            *samples.last().unwrap() // Safe: we checked is_empty() above
+        } else if src_idx + 1 < samples.len() {
+            // Normal case: interpolate between two samples
+            samples[src_idx] * (1.0 - frac) + samples[src_idx + 1] * frac
         } else {
-            samples[src_idx.min(samples.len() - 1)]
+            // At last sample - no interpolation
+            samples[src_idx]
         };
 
         output.push(sample);
@@ -315,6 +356,23 @@ pub const STEM_SAMPLE_RATE: u32 = 44100;
 /// Unlike `decode()`, this preserves stereo channels and uses 44.1kHz
 /// which is required by HTDemucs and other stem separation models.
 pub fn decode_stereo(path: &Path) -> Result<StereoBuffer> {
+    // Check file size before attempting to decode (same as decode())
+    // Stereo decoding uses 2x memory, so this check is even more important
+    let metadata = std::fs::metadata(path).map_err(|e| DjprepError::DecodeError {
+        path: path.to_path_buf(),
+        reason: format!("Failed to read file metadata: {}", e),
+    })?;
+
+    if metadata.len() > MAX_FILE_SIZE {
+        return Err(DjprepError::DecodeError {
+            path: path.to_path_buf(),
+            reason: format!(
+                "File too large ({:.1} GB). Maximum supported size is 2 GB.",
+                metadata.len() as f64 / (1024.0 * 1024.0 * 1024.0)
+            ),
+        });
+    }
+
     let file = std::fs::File::open(path).map_err(|e| DjprepError::DecodeError {
         path: path.to_path_buf(),
         reason: format!("Failed to open file: {}", e),
