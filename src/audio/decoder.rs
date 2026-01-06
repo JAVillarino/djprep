@@ -25,6 +25,12 @@ pub const TARGET_SAMPLE_RATE: u32 = 22050;
 /// Prevents OOM on extremely large files
 const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Default sample rate if not specified in file metadata
+const DEFAULT_SAMPLE_RATE: u32 = 44100;
+
+/// Default channel count if not specified in file metadata
+const DEFAULT_CHANNELS: usize = 2;
+
 /// Decode an audio file to a mono AudioBuffer
 pub fn decode(path: &Path) -> Result<AudioBuffer> {
     // Check file size before attempting to decode
@@ -79,8 +85,8 @@ pub fn decode(path: &Path) -> Result<AudioBuffer> {
     let track_id = track.id;
     let codec_params = track.codec_params.clone();
 
-    let source_sample_rate = codec_params.sample_rate.unwrap_or(44100);
-    let channels = codec_params.channels.map(|c| c.count()).unwrap_or(2);
+    let source_sample_rate = codec_params.sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE);
+    let channels = codec_params.channels.map(|c| c.count()).unwrap_or(DEFAULT_CHANNELS);
 
     debug!(
         "Decoding: {} @ {}Hz, {} channels",
@@ -409,8 +415,8 @@ pub fn decode_stereo(path: &Path) -> Result<StereoBuffer> {
     let track_id = track.id;
     let codec_params = track.codec_params.clone();
 
-    let source_sample_rate = codec_params.sample_rate.unwrap_or(44100);
-    let channels = codec_params.channels.map(|c| c.count()).unwrap_or(2);
+    let source_sample_rate = codec_params.sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE);
+    let channels = codec_params.channels.map(|c| c.count()).unwrap_or(DEFAULT_CHANNELS);
 
     debug!(
         "Decoding stereo: {} @ {}Hz, {} channels",

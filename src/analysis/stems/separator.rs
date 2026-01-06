@@ -264,9 +264,12 @@ impl OrtStemSeparator {
             reason: "ORT session not initialized".to_string(),
         })?;
 
-        let mut session = session_mutex.lock().map_err(|_| DjprepError::StemUnavailable {
-            reason: "Failed to acquire session lock".to_string(),
-        })?;
+        // Recover from mutex poisoning - if a previous inference panicked, we can
+        // still use the session since ONNX inference is idempotent
+        let mut session = session_mutex.lock().unwrap_or_else(|poisoned| {
+            warn!("Session mutex was poisoned (previous inference panicked), recovering...");
+            poisoned.into_inner()
+        });
 
         // Decode input audio at full fidelity (44.1kHz stereo)
         info!("Loading audio for stem separation...");

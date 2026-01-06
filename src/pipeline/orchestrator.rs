@@ -383,16 +383,17 @@ fn analyze_files(
                             output_dir: stems_dir.clone(),
                         };
                         // Use send_timeout to prevent deadlock if stem worker crashes.
-                        // Timeout of 30 seconds is generous - if channel is blocked that long,
+                        // Timeout is generous - if channel is blocked that long,
                         // the stem worker is likely dead. This allows rayon threads to continue
                         // rather than blocking forever.
                         use std::time::Duration;
-                        match tx.send_timeout(job, Duration::from_secs(30)) {
+                        match tx.send_timeout(job, Duration::from_secs(STEM_SEND_TIMEOUT_SECS)) {
                             Ok(()) => {}
                             Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
                                 warn!(
-                                    "Stem job queue blocked for 30s, skipping stems for {}. \
+                                    "Stem job queue blocked for {}s, skipping stems for {}. \
                                      Stem worker may have crashed.",
+                                    STEM_SEND_TIMEOUT_SECS,
                                     file.path.display()
                                 );
                             }
@@ -524,6 +525,10 @@ fn stem_worker(
 /// Minimum audio duration in seconds required for reliable analysis
 /// stratum-dsp needs at least 3-5 seconds for BPM/key detection
 const MIN_AUDIO_DURATION_SECS: f64 = 3.0;
+
+/// Timeout for sending stem jobs to the worker thread (seconds)
+/// If the queue is blocked this long, the stem worker may have crashed
+const STEM_SEND_TIMEOUT_SECS: u64 = 30;
 
 /// Analyze a single file
 fn analyze_single_file(

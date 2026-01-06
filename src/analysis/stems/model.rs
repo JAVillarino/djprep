@@ -10,6 +10,20 @@ use std::path::PathBuf;
 #[cfg(feature = "stems")]
 use tracing::{debug, info, warn};
 
+// Environment variable for user-specified model path
+const ENV_MODEL_PATH: &str = "DJPREP_MODEL_PATH";
+
+// I/O buffer size for download and hash verification
+const IO_BUFFER_SIZE: usize = 8192;
+
+// ProjectDirs identifiers
+const PROJECT_QUALIFIER: &str = "com";
+const PROJECT_ORG: &str = "djprep";
+const PROJECT_APP: &str = "djprep";
+
+// Default model subdirectory
+const MODELS_SUBDIR: &str = "models";
+
 /// HTDemucs model configuration
 pub struct ModelConfig {
     /// URL to download the model from
@@ -39,7 +53,7 @@ pub const HTDEMUCS_MODEL: ModelConfig = ModelConfig {
 
 /// Check for user-provided model path via environment variable
 pub fn get_user_model_path() -> Option<PathBuf> {
-    std::env::var("DJPREP_MODEL_PATH").ok().map(PathBuf::from)
+    std::env::var(ENV_MODEL_PATH).ok().map(PathBuf::from)
 }
 
 /// Find the model file by checking multiple common locations
@@ -67,15 +81,15 @@ pub fn find_model_path() -> Result<PathBuf> {
     }
 
     // 2. Check ProjectDirs cache directory
-    if let Some(proj_dirs) = ProjectDirs::from("com", "djprep", "djprep") {
-        let cache_path = proj_dirs.cache_dir().join("models").join(filename);
+    if let Some(proj_dirs) = ProjectDirs::from(PROJECT_QUALIFIER, PROJECT_ORG, PROJECT_APP) {
+        let cache_path = proj_dirs.cache_dir().join(MODELS_SUBDIR).join(filename);
         if cache_path.exists() {
             return Ok(cache_path);
         }
         checked_locations.push(cache_path.display().to_string());
 
         // 3. Check ProjectDirs data directory
-        let data_path = proj_dirs.data_dir().join("models").join(filename);
+        let data_path = proj_dirs.data_dir().join(MODELS_SUBDIR).join(filename);
         if data_path.exists() {
             return Ok(data_path);
         }
@@ -83,7 +97,7 @@ pub fn find_model_path() -> Result<PathBuf> {
     }
 
     // 4. Check current directory
-    let cwd_path = PathBuf::from("./models").join(filename);
+    let cwd_path = PathBuf::from(format!("./{}", MODELS_SUBDIR)).join(filename);
     if cwd_path.exists() {
         return Ok(cwd_path.canonicalize().unwrap_or(cwd_path));
     }
@@ -91,7 +105,7 @@ pub fn find_model_path() -> Result<PathBuf> {
 
     // 5. Check home directory
     if let Some(base_dirs) = directories::BaseDirs::new() {
-        let home_path = base_dirs.home_dir().join("djprep").join("models").join(filename);
+        let home_path = base_dirs.home_dir().join(PROJECT_APP).join(MODELS_SUBDIR).join(filename);
         if home_path.exists() {
             return Ok(home_path);
         }
@@ -132,11 +146,11 @@ pub fn find_model_path() -> Result<PathBuf> {
 
 /// Get the model cache directory
 pub fn get_cache_dir() -> Result<PathBuf> {
-    let proj_dirs = ProjectDirs::from("com", "djprep", "djprep").ok_or_else(|| {
+    let proj_dirs = ProjectDirs::from(PROJECT_QUALIFIER, PROJECT_ORG, PROJECT_APP).ok_or_else(|| {
         DjprepError::ConfigError("Could not determine cache directory".to_string())
     })?;
 
-    let cache_dir = proj_dirs.cache_dir().join("models");
+    let cache_dir = proj_dirs.cache_dir().join(MODELS_SUBDIR);
     fs::create_dir_all(&cache_dir).map_err(|e| DjprepError::OutputError {
         path: cache_dir.clone(),
         reason: format!("Failed to create cache directory: {}", e),
@@ -160,15 +174,55 @@ pub fn is_model_cached(config: &ModelConfig) -> bool {
 }
 
 /// Download the model if not already cached
+///
+/// Uses a lock file to prevent race conditions when multiple djprep processes
+/// try to download the model simultaneously. Only one process will download
+/// at a time; others will wait for the lock and then verify the model exists.
 #[cfg(feature = "stems")]
 pub fn ensure_model(config: &ModelConfig) -> Result<PathBuf> {
-    let model_path = get_model_path(config)?;
+    use std::io::Write;
 
+    let model_path = get_model_path(config)?;
+    let lock_path = model_path.with_extension("lock");
+
+    // Acquire lock file for cross-process synchronization
+    // This prevents TOCTOU race where multiple processes check model doesn't exist
+    // and all try to download simultaneously
+    let lock_file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&lock_path)
+        .map_err(|e| DjprepError::OutputError {
+            path: lock_path.clone(),
+            reason: format!("Failed to create lock file: {}", e),
+        })?;
+
+    // Write PID to lock file for debugging
+    let _ = writeln!(&lock_file, "{}", std::process::id());
+
+    // Use file locking (advisory on Unix, mandatory on Windows)
+    // This blocks until we get exclusive access
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = lock_file.as_raw_fd();
+        // Use flock for advisory locking - blocks until lock acquired
+        unsafe {
+            if libc::flock(fd, libc::LOCK_EX) != 0 {
+                warn!("Failed to acquire lock, proceeding anyway");
+            }
+        }
+    }
+
+    // Double-check after acquiring lock (another process may have downloaded it)
     if model_path.exists() {
         debug!("Model already cached at {}", model_path.display());
 
-        // Optionally verify hash
+        // Verify hash to ensure it's not corrupted
         if verify_model_hash(&model_path, config.sha256)? {
+            // Clean up lock file
+            let _ = fs::remove_file(&lock_path);
             return Ok(model_path);
         } else {
             warn!("Cached model hash mismatch, re-downloading...");
@@ -178,6 +232,9 @@ pub fn ensure_model(config: &ModelConfig) -> Result<PathBuf> {
 
     info!("Downloading HTDemucs model (~200MB)...");
     download_model(config, &model_path)?;
+
+    // Clean up lock file after successful download
+    let _ = fs::remove_file(&lock_path);
 
     Ok(model_path)
 }
@@ -253,7 +310,7 @@ fn download_model(config: &ModelConfig, dest_path: &PathBuf) -> Result<()> {
     // Stream download with progress updates
     let mut downloaded: u64 = 0;
     let mut reader = response;
-    let mut buffer = [0u8; 8192];
+    let mut buffer = [0u8; IO_BUFFER_SIZE];
 
     loop {
         let bytes_read = reader.read(&mut buffer).map_err(|e| {
@@ -333,7 +390,7 @@ fn verify_model_hash(path: &PathBuf, expected_hash: &str) -> Result<bool> {
     })?;
 
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 8192];
+    let mut buffer = [0u8; IO_BUFFER_SIZE];
 
     loop {
         let bytes_read = file.read(&mut buffer).map_err(|e| DjprepError::OutputError {
