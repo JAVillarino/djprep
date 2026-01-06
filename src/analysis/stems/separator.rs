@@ -20,6 +20,14 @@ use super::model::find_model_path;
 #[cfg(feature = "stems")]
 use ort::session::Session;
 
+// PCM audio constants for WAV output
+#[cfg(feature = "stems")]
+const PCM_I16_MAX: f32 = 32767.0;
+#[cfg(feature = "stems")]
+const PCM_I16_MIN: f32 = -32768.0;
+#[cfg(feature = "stems")]
+const WAV_BITS_PER_SAMPLE: u16 = 16;
+
 /// ONNX Runtime based stem separator using HTDemucs
 pub struct OrtStemSeparator {
     /// Path to the ONNX model
@@ -421,37 +429,46 @@ impl OrtStemSeparator {
             //   stem0_left[0..N], stem0_right[N..2N],
             //   stem1_left[2N..3N], stem1_right[3N..4N], ...
             // We verified contiguity above via length check.
-            let extract_stem = |stem_idx: usize| -> StereoBuffer {
+            // Extract stem closure returns Result to handle corrupted model output gracefully
+            let extract_stem = |stem_idx: usize| -> Result<StereoBuffer> {
                 // Use checked arithmetic to prevent overflow
                 let stem_offset = stem_idx.saturating_mul(num_channels).saturating_mul(output_samples);
                 let left_start = stem_offset;
                 let right_start = stem_offset.saturating_add(output_samples);
 
-                // Use assert! not debug_assert! - these checks must run in release builds
-                // to prevent out-of-bounds access from corrupted model output
-                assert!(
-                    left_start.saturating_add(output_samples) <= output_data.len(),
-                    "Left channel bounds check failed"
-                );
-                assert!(
-                    right_start.saturating_add(output_samples) <= output_data.len(),
-                    "Right channel bounds check failed"
-                );
+                // Validate bounds - return error instead of panicking on corrupted model output
+                // This allows graceful degradation: skip this file's stems instead of crashing
+                if left_start.saturating_add(output_samples) > output_data.len() {
+                    return Err(DjprepError::StemUnavailable {
+                        reason: format!(
+                            "Left channel bounds check failed for stem {}: offset {} + {} > {}",
+                            stem_idx, left_start, output_samples, output_data.len()
+                        ),
+                    });
+                }
+                if right_start.saturating_add(output_samples) > output_data.len() {
+                    return Err(DjprepError::StemUnavailable {
+                        reason: format!(
+                            "Right channel bounds check failed for stem {}: offset {} + {} > {}",
+                            stem_idx, right_start, output_samples, output_data.len()
+                        ),
+                    });
+                }
 
                 let left = output_data[left_start..left_start + output_samples].to_vec();
                 let right = output_data[right_start..right_start + output_samples].to_vec();
 
-                StereoBuffer::new(left, right, chunk.audio.sample_rate)
+                Ok(StereoBuffer::new(left, right, chunk.audio.sample_rate))
             };
 
             stem_chunks.push(StemChunk {
                 index: chunk.index,
                 start_sample: chunk.start_sample,
                 end_sample: chunk.end_sample,
-                vocals: extract_stem(0),
-                drums: extract_stem(1),
-                bass: extract_stem(2),
-                other: extract_stem(3),
+                vocals: extract_stem(0)?,
+                drums: extract_stem(1)?,
+                bass: extract_stem(2)?,
+                other: extract_stem(3)?,
             });
         }
 
@@ -475,7 +492,7 @@ impl OrtStemSeparator {
         let spec = hound::WavSpec {
             channels: 2,
             sample_rate: audio.sample_rate,
-            bits_per_sample: 16,
+            bits_per_sample: WAV_BITS_PER_SAMPLE,
             sample_format: hound::SampleFormat::Int,
         };
 
@@ -487,8 +504,8 @@ impl OrtStemSeparator {
 
         // Write interleaved stereo samples
         for (l, r) in audio.left.iter().zip(audio.right.iter()) {
-            let l_i16 = (*l * 32767.0).clamp(-32768.0, 32767.0) as i16;
-            let r_i16 = (*r * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            let l_i16 = (*l * PCM_I16_MAX).clamp(PCM_I16_MIN, PCM_I16_MAX) as i16;
+            let r_i16 = (*r * PCM_I16_MAX).clamp(PCM_I16_MIN, PCM_I16_MAX) as i16;
 
             writer
                 .write_sample(l_i16)

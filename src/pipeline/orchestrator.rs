@@ -382,11 +382,24 @@ fn analyze_files(
                             input_path: file.path.clone(),
                             output_dir: stems_dir.clone(),
                         };
-                        // Blocking send - when channel is full, this blocks until the stem
-                        // worker consumes a job. This provides natural backpressure to prevent
-                        // analysis from outpacing stem separation.
-                        if tx.send(job).is_err() {
-                            warn!("Failed to submit stem job for {}", file.path.display());
+                        // Use send_timeout to prevent deadlock if stem worker crashes.
+                        // Timeout of 30 seconds is generous - if channel is blocked that long,
+                        // the stem worker is likely dead. This allows rayon threads to continue
+                        // rather than blocking forever.
+                        use std::time::Duration;
+                        match tx.send_timeout(job, Duration::from_secs(30)) {
+                            Ok(()) => {}
+                            Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
+                                warn!(
+                                    "Stem job queue blocked for 30s, skipping stems for {}. \
+                                     Stem worker may have crashed.",
+                                    file.path.display()
+                                );
+                            }
+                            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                                // Stem worker has shut down, channel closed
+                                debug!("Stem channel closed, skipping stems for {}", file.path.display());
+                            }
                         }
                     }
 
@@ -426,8 +439,24 @@ fn analyze_files(
 
     // Wait for stem worker to complete
     if let Some(handle) = stem_handle {
-        if handle.join().is_err() {
-            warn!("Stem worker thread panicked");
+        match handle.join() {
+            Ok(()) => {
+                debug!("Stem worker thread completed successfully");
+            }
+            Err(panic_info) => {
+                // Extract panic message if possible
+                let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                error!(
+                    "Stem worker thread panicked: {}. Some stems may not have been generated.",
+                    panic_msg
+                );
+            }
         }
     }
 

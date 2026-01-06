@@ -15,6 +15,19 @@ use tracing::info;
 use super::schema::{self, attrs, node_types};
 use super::uri::path_to_rekordbox_uri;
 
+// BPM validation constants
+const BPM_MIN_VALUE: f64 = 1.0;
+const BPM_MAX_VALUE: f64 = 999.99;
+const DEFAULT_BPM: &str = "120.00";
+
+// Confidence scaling
+const CONFIDENCE_PERCENT_SCALE: f64 = 100.0;
+const CONFIDENCE_MIN: f64 = 0.0;
+const CONFIDENCE_MAX: f64 = 100.0;
+
+// Playlist name prefix for import workaround
+const PLAYLIST_PREFIX: &str = "djprep_import_";
+
 /// Write analyzed tracks to a Rekordbox XML file
 ///
 /// Uses atomic write pattern: writes to a temp file first, then renames.
@@ -161,9 +174,9 @@ fn write_track<W: std::io::Write>(
 
     // BPM (2 decimal places) - guard against NaN/Inf for valid XML
     let bpm = if track.bpm.value.is_finite() && track.bpm.value > 0.0 {
-        format!("{:.2}", track.bpm.value.clamp(1.0, 999.99))
+        format!("{:.2}", track.bpm.value.clamp(BPM_MIN_VALUE, BPM_MAX_VALUE))
     } else {
-        "120.00".to_string() // Reasonable default for invalid BPM
+        DEFAULT_BPM.to_string() // Reasonable default for invalid BPM
     };
     elem.push_attribute((attrs::AVERAGE_BPM, bpm.as_str()));
 
@@ -179,14 +192,14 @@ fn write_track<W: std::io::Write>(
 
     // Comments (include analysis confidence info) - clamp confidence to valid range
     let bpm_conf = if track.bpm.confidence.is_finite() {
-        (track.bpm.confidence * 100.0).clamp(0.0, 100.0)
+        (track.bpm.confidence * CONFIDENCE_PERCENT_SCALE).clamp(CONFIDENCE_MIN, CONFIDENCE_MAX)
     } else {
-        0.0
+        CONFIDENCE_MIN
     };
     let key_conf = if track.key.confidence.is_finite() {
-        (track.key.confidence * 100.0).clamp(0.0, 100.0)
+        (track.key.confidence * CONFIDENCE_PERCENT_SCALE).clamp(CONFIDENCE_MIN, CONFIDENCE_MAX)
     } else {
-        0.0
+        CONFIDENCE_MIN
     };
     let comment = format!(
         "djprep: BPM conf={:.0}%, Key conf={:.0}%",
@@ -221,7 +234,7 @@ fn write_playlists<W: std::io::Write>(
     // Import workaround playlist
     // Per Section 4.4 of spec: Rekordbox only updates metadata via playlist import
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    let playlist_name = format!("djprep_import_{}", timestamp);
+    let playlist_name = format!("{}{}", PLAYLIST_PREFIX, timestamp);
 
     let mut playlist_node = BytesStart::new("NODE");
     playlist_node.push_attribute(("Type", node_types::PLAYLIST));

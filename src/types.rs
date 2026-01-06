@@ -95,7 +95,7 @@ pub enum Mode {
 // =============================================================================
 
 /// BPM analysis result
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BpmResult {
     /// Primary detected BPM
     pub value: f64,
@@ -116,7 +116,7 @@ impl Default for BpmResult {
 }
 
 /// Musical key analysis result
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeyResult {
     /// Detected pitch class (C, C#, D, etc.)
     pub pitch_class: PitchClass,
@@ -143,7 +143,7 @@ impl Default for KeyResult {
 }
 
 /// Paths to separated stem files
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StemPaths {
     pub vocals: PathBuf,
     pub drums: PathBuf,
@@ -156,7 +156,7 @@ pub struct StemPaths {
 // =============================================================================
 
 /// Metadata extracted from audio file tags
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackMetadata {
     pub title: Option<String>,
     pub artist: Option<String>,
