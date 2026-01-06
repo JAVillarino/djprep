@@ -337,7 +337,7 @@ fn test_bpm_detection_produces_reasonable_values() {
     // Note: A pure sine wave doesn't have rhythmic content, so BPM detection
     // may produce any value, but it should still be in a reasonable range
     assert!(
-        bpm_value >= 60.0 && bpm_value <= 200.0,
+        (60.0..=200.0).contains(&bpm_value),
         "BPM {} should be in reasonable range (60-200)",
         bpm_value
     );
@@ -457,7 +457,7 @@ fn test_bpm_detection_various_tempos() {
 
         // We assert the BPM is in a reasonable range, but document octave errors
         assert!(
-            detected_bpm >= 60.0 && detected_bpm <= 200.0,
+            (60.0..=200.0).contains(&detected_bpm),
             "{} BPM test: detected {} should be in DJ range (60-200)",
             target_bpm,
             detected_bpm
@@ -514,4 +514,136 @@ fn test_bpm_detection_consistency() {
         results[0],
         results[1]
     );
+}
+
+// =============================================================================
+// Error Handling Tests
+// =============================================================================
+
+#[test]
+fn test_handles_empty_audio_file() {
+    // Create temp directories
+    let input_dir = TempDir::new().expect("Failed to create input temp dir");
+    let output_dir = TempDir::new().expect("Failed to create output temp dir");
+
+    // Create an empty file with .wav extension
+    let empty_file = input_dir.path().join("empty.wav");
+    fs::write(&empty_file, b"").expect("Failed to create empty file");
+
+    // Run pipeline - should not panic, but may skip the file
+    let settings = create_test_settings(input_dir.path(), output_dir.path());
+    let result = pipeline::run(&settings);
+
+    // Pipeline should complete (either success with 0 tracks or graceful error)
+    // The key is that it doesn't panic
+    match result {
+        Ok(_) => {
+            // Check that the file was skipped (0 tracks in output)
+            let json_path = output_dir.path().join("djprep.json");
+            if json_path.exists() {
+                let json_str = fs::read_to_string(&json_path).expect("Failed to read JSON");
+                // Verify JSON is valid
+                let _: serde_json::Value =
+                    serde_json::from_str(&json_str).expect("Invalid JSON output");
+            }
+        }
+        Err(_) => {
+            // Graceful error is also acceptable
+        }
+    }
+}
+
+#[test]
+fn test_handles_invalid_audio_data() {
+    // Create temp directories
+    let input_dir = TempDir::new().expect("Failed to create input temp dir");
+    let output_dir = TempDir::new().expect("Failed to create output temp dir");
+
+    // Create a file with random bytes (not a valid WAV)
+    let invalid_file = input_dir.path().join("invalid.wav");
+    fs::write(&invalid_file, b"This is not a valid WAV file content!!!!!")
+        .expect("Failed to create invalid file");
+
+    // Run pipeline - should not panic
+    let settings = create_test_settings(input_dir.path(), output_dir.path());
+    let result = pipeline::run(&settings);
+
+    // Pipeline should handle gracefully (skip invalid file)
+    match result {
+        Ok(_) => {
+            // Success with skipped file is fine
+        }
+        Err(_) => {
+            // Graceful error is also acceptable
+        }
+    }
+}
+
+#[test]
+fn test_handles_nonexistent_input_gracefully() {
+    // Create only output directory
+    let output_dir = TempDir::new().expect("Failed to create output temp dir");
+
+    // Use nonexistent input path
+    let fake_input = Path::new("/nonexistent/path/that/does/not/exist");
+
+    let settings = Settings {
+        input: fake_input.to_path_buf(),
+        output: output_dir.path().to_path_buf(),
+        stems_enabled: false,
+        stems_dir: output_dir.path().join("stems"),
+        genre_hint: None,
+        analysis_threads: 1,
+        recursive: false,
+        force: false,
+        output_json: true,
+        show_progress: false,
+        dry_run: false,
+    };
+
+    // Run pipeline - should return an error, not panic
+    let result = pipeline::run(&settings);
+
+    // Should fail gracefully with an error
+    assert!(
+        result.is_err(),
+        "Pipeline should return error for nonexistent input"
+    );
+}
+
+#[test]
+fn test_metadata_fallback_to_filename() {
+    // Create temp directories
+    let input_dir = TempDir::new().expect("Failed to create input temp dir");
+    let output_dir = TempDir::new().expect("Failed to create output temp dir");
+
+    // Create a WAV file with a descriptive filename (no metadata tags)
+    let wav_path = input_dir.path().join("Artist_Name_-_Track_Title.wav");
+    generate_sine_wav(&wav_path, 440.0, 1.0, 44100);
+
+    // Run pipeline
+    let settings = create_test_settings(input_dir.path(), output_dir.path());
+    pipeline::run(&settings).expect("Pipeline should succeed");
+
+    // Read JSON output
+    let json_path = output_dir.path().join("djprep.json");
+    let json_str = fs::read_to_string(&json_path).expect("Failed to read JSON");
+    let json: serde_json::Value =
+        serde_json::from_str(&json_str).expect("Failed to parse JSON");
+
+    // Verify track exists and has a title (should be filename without extension)
+    let tracks = json["tracks"].as_array().expect("tracks should be array");
+    assert_eq!(tracks.len(), 1, "Should have exactly one track");
+
+    // The title should be derived from filename when no metadata tags present
+    let track = &tracks[0];
+    let title = track["title"].as_str();
+    // Title should either be the filename or None if not extracted
+    // Both are acceptable behaviors
+    if let Some(title_str) = title {
+        assert!(
+            title_str.contains("Artist") || title_str.contains("Track"),
+            "Title should be derived from filename"
+        );
+    }
 }

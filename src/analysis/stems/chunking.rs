@@ -1,14 +1,48 @@
 //! Audio chunking with overlap-add for stem separation
 //!
-//! HTDemucs v4 has a maximum segment length of ~7.8 seconds.
-//! This module handles splitting audio into chunks and reassembling stems.
+//! HTDemucs v4 has a maximum segment length of ~7.8 seconds due to memory constraints
+//! and the model's receptive field. This module handles splitting audio into chunks
+//! and reassembling stems using overlap-add with linear crossfade.
+//!
+//! # Chunking Strategy
+//!
+//! ```text
+//! Input audio:  [===============================================]
+//! Chunk 1:      [=======]
+//! Chunk 2:          [=======]     (overlaps with chunk 1)
+//! Chunk 3:              [=======] (overlaps with chunk 2)
+//!                   ^^^
+//!                   1-second overlap zone with linear crossfade
+//! ```
+//!
+//! # Why 7.8 seconds?
+//!
+//! - HTDemucs v4 was trained on 7.8-second segments (343,980 samples at 44.1kHz)
+//! - Longer segments would exceed GPU memory on typical hardware
+//! - Shorter segments lose musical context, hurting separation quality
+//!
+//! # Why 1-second overlap?
+//!
+//! - Provides enough audio for smooth crossfade transitions
+//! - Minimizes audible artifacts at chunk boundaries
+//! - Balances quality vs computational overhead (more overlap = more processing)
+//!
+//! # Crossfade Formula
+//!
+//! In the overlap region, samples are blended using linear interpolation:
+//! ```text
+//! output[i] = chunk_a[i] * (1 - t) + chunk_b[i] * t
+//! ```
+//! where `t` ranges from 0 to 1 across the overlap zone.
 
 use crate::types::StereoBuffer;
 
 /// HTDemucs v4 maximum segment length in seconds
+/// This matches the model's training configuration (343,980 samples at 44.1kHz)
 pub const MAX_SEGMENT_SECONDS: f32 = 7.8;
 
-/// Overlap between segments in seconds (for smooth crossfade)
+/// Overlap between segments in seconds for smooth crossfade reconstruction
+/// 1 second provides ~44,100 samples for blending at 44.1kHz
 pub const OVERLAP_SECONDS: f32 = 1.0;
 
 /// Configuration for audio chunking

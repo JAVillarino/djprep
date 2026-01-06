@@ -19,8 +19,28 @@ use tracing::{debug, trace};
 /// while reducing computation by 50% compared to 44.1kHz
 pub const TARGET_SAMPLE_RATE: u32 = 22050;
 
+/// Maximum file size we'll attempt to decode (2GB)
+/// Prevents OOM on extremely large files
+const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Decode an audio file to a mono AudioBuffer
 pub fn decode(path: &Path) -> Result<AudioBuffer> {
+    // Check file size before attempting to decode
+    let metadata = std::fs::metadata(path).map_err(|e| DjprepError::DecodeError {
+        path: path.to_path_buf(),
+        reason: format!("Failed to read file metadata: {}", e),
+    })?;
+
+    if metadata.len() > MAX_FILE_SIZE {
+        return Err(DjprepError::DecodeError {
+            path: path.to_path_buf(),
+            reason: format!(
+                "File too large ({:.1} GB). Maximum supported size is 2 GB.",
+                metadata.len() as f64 / (1024.0 * 1024.0 * 1024.0)
+            ),
+        });
+    }
+
     let file = std::fs::File::open(path).map_err(|e| DjprepError::DecodeError {
         path: path.to_path_buf(),
         reason: format!("Failed to open file: {}", e),

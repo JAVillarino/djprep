@@ -33,10 +33,15 @@ pub struct PipelineResult {
 
 /// Run the full analysis pipeline
 pub fn run(settings: &Settings) -> Result<PipelineResult> {
+    use std::time::Instant;
+
+    let pipeline_start = Instant::now();
+
     // Configure thread pool
     configure_thread_pool(settings.analysis_threads)?;
 
     // Phase 1: Discovery
+    let discovery_start = Instant::now();
     info!("Scanning for audio files...");
     let files = discovery::scan(&settings.input, settings.recursive)?;
 
@@ -49,7 +54,12 @@ pub fn run(settings: &Settings) -> Result<PipelineResult> {
         });
     }
 
-    info!("Found {} audio files", files.len());
+    let discovery_elapsed = discovery_start.elapsed();
+    info!(
+        "Found {} audio files in {:.2}s",
+        files.len(),
+        discovery_elapsed.as_secs_f64()
+    );
 
     // Dry run mode - show files and exit
     if settings.dry_run {
@@ -101,12 +111,34 @@ pub fn run(settings: &Settings) -> Result<PipelineResult> {
     info!("Analyzing {} files", files_to_analyze.len());
 
     // Phase 2: Analysis
+    let analysis_start = std::time::Instant::now();
     let (tracks, stats) = analyze_files(&files_to_analyze, settings)?;
+    let analysis_elapsed = analysis_start.elapsed();
+    let tracks_per_sec = if analysis_elapsed.as_secs_f64() > 0.0 {
+        files_to_analyze.len() as f64 / analysis_elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    info!(
+        "Analysis completed in {:.2}s ({:.1} tracks/sec)",
+        analysis_elapsed.as_secs_f64(),
+        tracks_per_sec
+    );
 
     // Phase 3: Export
     if !tracks.is_empty() {
+        let export_start = std::time::Instant::now();
         export_results(&tracks, settings)?;
+        info!(
+            "Export completed in {:.2}s",
+            export_start.elapsed().as_secs_f64()
+        );
     }
+
+    info!(
+        "Total pipeline time: {:.2}s",
+        pipeline_start.elapsed().as_secs_f64()
+    );
 
     Ok(PipelineResult {
         total_files,
@@ -309,7 +341,7 @@ fn analyze_files(
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg}")
-                .unwrap()
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
                 .progress_chars("=>-"),
         );
         Some(pb)

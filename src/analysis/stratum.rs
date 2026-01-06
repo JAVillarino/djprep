@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_stratum_key_detector_name() {
-        let detector = StratumKeyDetector::default();
+        let detector = StratumKeyDetector;
         assert_eq!(detector.name(), "stratum-dsp");
     }
 }

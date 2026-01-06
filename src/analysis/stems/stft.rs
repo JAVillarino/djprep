@@ -2,15 +2,32 @@
 //!
 //! HTDemucs requires STFT-preprocessed audio as input.
 //! Parameters match the model training: nfft=4096, hop_length=1024
+//!
+//! # STFT Parameter Choices
+//!
+//! - **NFFT = 4096**: Window size that balances frequency resolution vs time resolution.
+//!   At 44.1kHz, this gives ~93ms windows with 2049 frequency bins (~10.7 Hz resolution).
+//!   This matches the HTDemucs model training parameters from Facebook Research.
+//!
+//! - **HOP_LENGTH = 1024**: Step size between consecutive frames (75% overlap).
+//!   Provides good temporal resolution while maintaining COLA (Constant Overlap-Add)
+//!   property needed for perfect reconstruction in ISTFT.
+//!
+//! - **Hann window**: Smooth tapering reduces spectral leakage. Combined with 75%
+//!   overlap, satisfies the COLA condition for artifact-free reconstruction.
 
 #[cfg(feature = "stems")]
 use rustfft::{num_complex::Complex, FftPlanner};
 
 use crate::types::StereoBuffer;
 
-/// STFT parameters matching HTDemucs training
+/// FFT window size - matches HTDemucs training (4096 samples = ~93ms at 44.1kHz)
 pub const NFFT: usize = 4096;
+
+/// Hop length between frames - 75% overlap for COLA compliance
 pub const HOP_LENGTH: usize = 1024;
+
+/// Number of frequency bins in positive-frequency half of spectrum
 pub const NUM_FREQ_BINS: usize = NFFT / 2 + 1; // 2049
 
 /// Complex spectrogram for a stereo signal
