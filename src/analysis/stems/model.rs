@@ -24,20 +24,17 @@ pub struct ModelConfig {
 
 /// Default HTDemucs ONNX model
 ///
-/// Model source options:
-/// 1. Intel OpenVINO Audacity Plugin (pre-converted)
-/// 2. Convert using sevagh/demucs.onnx
-/// 3. User-provided local path via DJPREP_MODEL_PATH env var
+/// Source: gentij/htdemucs-ort on Hugging Face
+/// - Direct download, no extraction needed
+/// - Pre-optimized .ort format for ONNX Runtime
+/// - SHA256 verified
 ///
-/// Note: The Intel model requires extraction from their release zip.
-/// See README for setup instructions.
+/// Users can override with DJPREP_MODEL_PATH env var.
 pub const HTDEMUCS_MODEL: ModelConfig = ModelConfig {
-    // Note: This URL is for reference. The actual model needs manual download
-    // because Intel packages it in a zip archive.
-    url: "https://github.com/intel/openvino-plugins-ai-audacity/releases/download/v3.4.2-R1/openvino-models.zip",
-    sha256: "placeholder_hash_replace_with_actual",
-    filename: "htdemucs_v4.onnx",
-    size_bytes: 170_000_000, // ~170MB
+    url: "https://huggingface.co/gentij/htdemucs-ort/resolve/main/htdemucs.ort",
+    sha256: "09dc165512d8ef7480bcb2cacea9dda82d571f8dbf421d8c44a2ca5568bec729",
+    filename: "htdemucs.ort",
+    size_bytes: 209_884_896, // ~200MB
 };
 
 /// Check for user-provided model path via environment variable
@@ -101,26 +98,36 @@ pub fn find_model_path() -> Result<PathBuf> {
         checked_locations.push(home_path.display().to_string());
     }
 
-    // Model not found - generate helpful error
-    let locations_list = checked_locations
-        .iter()
-        .map(|loc| format!("  - {}", loc))
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Model not found locally - try to download automatically
+    #[cfg(feature = "stems")]
+    {
+        info!(
+            "HTDemucs model not found locally, downloading from Hugging Face (~200MB)..."
+        );
+        ensure_model(&HTDEMUCS_MODEL)
+    }
 
-    Err(DjprepError::StemUnavailable {
-        reason: format!(
-            "HTDemucs model not found.\n\n\
-             Locations checked:\n{}\n\n\
-             To fix this, either:\n\
-             1. Set the environment variable:\n\
-                export DJPREP_MODEL_PATH=/path/to/htdemucs_v4.onnx\n\n\
-             2. Or place the model in one of the above locations.\n\n\
-             Download the model from:\n\
-             https://github.com/intel/openvino-plugins-ai-audacity/releases",
-            locations_list
-        ),
-    })
+    // Without stems feature, just report the error
+    #[cfg(not(feature = "stems"))]
+    {
+        let locations_list = checked_locations
+            .iter()
+            .map(|loc| format!("  - {}", loc))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        Err(DjprepError::StemUnavailable {
+            reason: format!(
+                "HTDemucs model not found.\n\n\
+                 Locations checked:\n{}\n\n\
+                 To fix this, either:\n\
+                 1. Set the environment variable:\n\
+                    export DJPREP_MODEL_PATH=/path/to/htdemucs.ort\n\n\
+                 2. Or place the model in one of the above locations.",
+                locations_list
+            ),
+        })
+    }
 }
 
 /// Get the model cache directory
@@ -175,10 +182,11 @@ pub fn ensure_model(config: &ModelConfig) -> Result<PathBuf> {
     Ok(model_path)
 }
 
-/// Download the model from URL
+/// Download the model from URL with progress indicator
 #[cfg(feature = "stems")]
 fn download_model(config: &ModelConfig, dest_path: &PathBuf) -> Result<()> {
-    use std::io::Write;
+    use indicatif::{ProgressBar, ProgressStyle};
+    use std::io::{Read, Write};
 
     let response = reqwest::blocking::get(config.url).map_err(|e| {
         DjprepError::ModelDownloadError {
@@ -192,22 +200,54 @@ fn download_model(config: &ModelConfig, dest_path: &PathBuf) -> Result<()> {
         });
     }
 
-    let bytes = response.bytes().map_err(|e| {
-        DjprepError::ModelDownloadError {
-            reason: format!("Failed to read model data: {}", e),
-        }
-    })?;
+    // Get content length from response or use known size
+    let total_size = response
+        .content_length()
+        .unwrap_or(config.size_bytes);
 
+    // Create progress bar
+    let pb = ProgressBar::new(total_size);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{msg}\n{bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("##-"),
+    );
+    pb.set_message("Downloading HTDemucs model...");
+
+    // Create output file
     let mut file = fs::File::create(dest_path).map_err(|e| DjprepError::OutputError {
         path: dest_path.clone(),
         reason: format!("Failed to create model file: {}", e),
     })?;
 
-    file.write_all(&bytes).map_err(|e| DjprepError::OutputError {
-        path: dest_path.clone(),
-        reason: format!("Failed to write model file: {}", e),
-    })?;
+    // Stream download with progress updates
+    let mut downloaded: u64 = 0;
+    let mut reader = response;
+    let mut buffer = [0u8; 8192];
 
+    loop {
+        let bytes_read = reader.read(&mut buffer).map_err(|e| {
+            DjprepError::ModelDownloadError {
+                reason: format!("Failed to read model data: {}", e),
+            }
+        })?;
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        file.write_all(&buffer[..bytes_read])
+            .map_err(|e| DjprepError::OutputError {
+                path: dest_path.clone(),
+                reason: format!("Failed to write model file: {}", e),
+            })?;
+
+        downloaded += bytes_read as u64;
+        pb.set_position(downloaded);
+    }
+
+    pb.finish_with_message("Download complete!");
     info!("Model downloaded to {}", dest_path.display());
 
     // Verify hash after download

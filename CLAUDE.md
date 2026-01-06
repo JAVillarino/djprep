@@ -21,7 +21,7 @@ The project is **feature-complete** and ready for v0.1.0 release:
 | Audio Decoding | ✅ Complete | symphonia, 22050Hz mono for analysis, 44100Hz stereo for stems |
 | BPM Detection | ✅ Complete | stratum-dsp 1.0, genre-aware tempo correction |
 | Key Detection | ✅ Complete | stratum-dsp 1.0, Camelot/Open Key notation |
-| Stem Separation | ✅ Complete | ort 2.0 + HTDemucs, STFT preprocessing, overlap-add |
+| Stem Separation | ✅ Complete | ort 2.0 + HTDemucs, auto-download, GPU acceleration |
 | Metadata Extraction | ✅ Complete | lofty 0.18, ID3v2/Vorbis/AIFF tags |
 | Rekordbox XML | ✅ Complete | Streaming writer, URI encoding |
 | JSON Export | ✅ Complete | Sidecar file with full analysis data |
@@ -36,6 +36,7 @@ The project is **feature-complete** and ready for v0.1.0 release:
 - ✅ Integration tests with sample audio
 - ✅ Improved error messages with actionable guidance
 - ✅ Model auto-discovery (checks multiple locations)
+- ✅ Automatic model download from Hugging Face (~200MB, with progress bar)
 - ✅ Dry-run mode
 - ✅ Incremental analysis (--force flag)
 
@@ -60,18 +61,6 @@ Requirements:
 - Create src/export/serato.rs module
 - Add --format serato CLI option
 - Test with real Serato installation if possible
-```
-
-**To add automatic model download:**
-```
-Implement automatic HTDemucs model download.
-
-Requirements:
-- Download from Intel OpenVINO releases
-- Show progress bar during download
-- Verify SHA256 hash after download
-- Store in ~/.cache/djprep/models/
-- Handle network errors gracefully
 ```
 
 **To optimize performance:**
@@ -603,19 +592,7 @@ Implementation:
 - CLI flag: --format rekordbox|serato|traktor|all
 ```
 
-### Priority 2: Automatic Model Download
-
-```
-Automatically download HTDemucs model when needed.
-
-Considerations:
-- Model is ~170MB, need progress bar
-- Should verify SHA256 hash
-- Store in user cache directory
-- Handle download failures gracefully
-```
-
-### Priority 3: Waveform Generation
+### Priority 2: Waveform Generation
 
 ```
 Generate waveform data for visual display.
@@ -627,7 +604,7 @@ Options:
 - Output as JSON or binary format
 ```
 
-### Priority 4: Performance Optimization
+### Priority 3: Performance Optimization
 
 ```
 Benchmark and optimize for large libraries (10,000+ tracks).
@@ -667,8 +644,8 @@ cargo check --features stems
 # Run with verbose logging
 RUST_LOG=debug cargo run -- -i ./test -o ./out
 
-# Run with stems enabled
-DJPREP_MODEL_PATH=/path/to/model.onnx cargo run --features stems -- -i ./test -o ./out --stems
+# Run with stems enabled (model auto-downloads on first run)
+cargo run --features stems -- -i ./test -o ./out --stems
 
 # Run all tests
 cargo test
@@ -688,6 +665,7 @@ cargo fmt
 ```
 src/analysis/traits.rs       # Trait definitions (BpmDetector, KeyDetector, StemSeparator)
 src/analysis/stratum.rs      # BPM/Key detection implementation
+src/analysis/stems/model.rs  # Model auto-download and caching
 src/analysis/stems/separator.rs  # Stem separation with ort
 src/pipeline/orchestrator.rs # Main pipeline with bounded channel queue
 src/types.rs                 # Data structures (AnalyzedTrack, BpmResult, KeyResult)

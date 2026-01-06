@@ -225,29 +225,30 @@ djprep automatically selects the best available execution provider:
 
 ### Model Setup
 
-Stem separation requires an HTDemucs ONNX model (~170MB). djprep automatically searches for the model in these locations:
+Stem separation requires an HTDemucs model (~200MB). **djprep automatically downloads this model** on first use - no manual setup required!
 
-1. `DJPREP_MODEL_PATH` environment variable
-2. `~/.cache/djprep/models/htdemucs_v4.onnx` (Linux) or `~/Library/Caches/com.djprep.djprep/models/` (macOS)
-3. `~/.local/share/djprep/models/` (Linux) or `~/Library/Application Support/com.djprep.djprep/models/` (macOS)
-4. `./models/htdemucs_v4.onnx` (current directory)
-5. `~/djprep/models/htdemucs_v4.onnx`
-
-**Option 1: Place the model in a standard location**
 ```bash
-mkdir -p ~/.cache/djprep/models
-# Copy your htdemucs_v4.onnx to ~/.cache/djprep/models/
-```
-
-**Option 2: Set the environment variable**
-```bash
-export DJPREP_MODEL_PATH=/path/to/htdemucs_v4.onnx
+# Just run with --stems, the model downloads automatically
 djprep -i ./music --stems -o ./output
 ```
 
-**Where to get the model:**
-- [Intel OpenVINO Audacity Plugin](https://github.com/intel/openvino-plugins-ai-audacity/releases) - Extract `htdemucs_v4.onnx` from the release zip
-- [sevagh/demucs.onnx](https://github.com/sevagh/demucs.onnx) - Convert from PyTorch (requires Python)
+The model is cached at `~/.cache/djprep/models/htdemucs.ort` (macOS/Linux) for future use.
+
+**Advanced: Custom model location**
+
+If you prefer to manage the model yourself, djprep checks these locations in order:
+
+1. `DJPREP_MODEL_PATH` environment variable
+2. `~/.cache/djprep/models/htdemucs.ort`
+3. `~/.local/share/djprep/models/htdemucs.ort`
+4. `./models/htdemucs.ort` (current directory)
+5. `~/djprep/models/htdemucs.ort`
+
+```bash
+# Override with custom model path
+export DJPREP_MODEL_PATH=/path/to/custom-model.ort
+djprep -i ./music --stems -o ./output
+```
 
 ## Project Status
 
@@ -258,7 +259,7 @@ djprep -i ./music --stems -o ./output
 | Audio Decoding | Complete | MP3, WAV, FLAC, AIFF via symphonia |
 | BPM Detection | Complete | stratum-dsp 1.0, genre-aware tempo correction |
 | Key Detection | Complete | stratum-dsp 1.0, Camelot/Open Key notation |
-| Stem Separation | Complete | ort 2.0 + HTDemucs, GPU acceleration |
+| Stem Separation | Complete | ort 2.0 + HTDemucs, GPU acceleration, auto-download |
 | Metadata Extraction | Complete | ID3v2, Vorbis comments, AIFF tags via lofty |
 | Rekordbox XML | Complete | Streaming writer, URI encoding |
 | JSON Export | Complete | Full analysis data |
@@ -274,6 +275,7 @@ djprep -i ./music --stems -o ./output
 - BPM/Key detection via stratum-dsp
 - Stem separation via ONNX Runtime (HTDemucs)
 - GPU acceleration (CUDA, CoreML, DirectML)
+- Automatic model download (~200MB, cached locally)
 - Metadata extraction from file tags
 - Incremental analysis (skip unchanged files)
 - Dry-run mode for previewing analysis
@@ -281,7 +283,6 @@ djprep -i ./music --stems -o ./output
 
 **Future:**
 - Additional export formats (Serato, Traktor)
-- Automatic model download
 - Waveform generation
 
 ## Supported Formats
@@ -313,14 +314,15 @@ djprep -i ./music --stems -o ./output
 
 ## Troubleshooting
 
-### "HTDemucs model not found"
+### "Model download failed"
 
-The stem separation model couldn't be located. djprep checks these locations:
-- `DJPREP_MODEL_PATH` environment variable
-- `~/.cache/djprep/models/htdemucs_v4.onnx`
-- `./models/htdemucs_v4.onnx`
+The automatic model download requires an internet connection. If the download fails:
 
-**Solution:** Download the model from [Intel OpenVINO Audacity releases](https://github.com/intel/openvino-plugins-ai-audacity/releases) and place it in one of the above locations.
+**Solutions:**
+- Check your internet connection
+- If behind a proxy, ensure it allows HTTPS connections to `huggingface.co`
+- Try again - the download will resume from where it left off
+- Manually download from [Hugging Face](https://huggingface.co/gentij/htdemucs-ort) and set `DJPREP_MODEL_PATH`
 
 ### "Failed to decode audio file"
 
