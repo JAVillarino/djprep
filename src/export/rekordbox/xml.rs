@@ -16,10 +16,25 @@ use super::schema::{self, attrs, node_types};
 use super::uri::path_to_rekordbox_uri;
 
 /// Write analyzed tracks to a Rekordbox XML file
+///
+/// Uses atomic write pattern: writes to a temp file first, then renames.
+/// This prevents data corruption if the write is interrupted.
 pub fn write_rekordbox_xml(tracks: &[AnalyzedTrack], output_path: &Path) -> Result<()> {
-    let file = File::create(output_path).map_err(|e| DjprepError::OutputError {
+    // Write to temp file in same directory (ensures same filesystem for atomic rename)
+    let temp_path = output_path.with_extension("xml.tmp");
+
+    // Helper to clean up temp file on error
+    let cleanup_and_error = |reason: String| -> DjprepError {
+        let _ = std::fs::remove_file(&temp_path);
+        DjprepError::OutputError {
+            path: output_path.to_path_buf(),
+            reason,
+        }
+    };
+
+    let file = File::create(&temp_path).map_err(|e| DjprepError::OutputError {
         path: output_path.to_path_buf(),
-        reason: e.to_string(),
+        reason: format!("Failed to create temp file: {}", e),
     })?;
 
     let writer = BufWriter::new(file);
@@ -31,42 +46,60 @@ pub fn write_rekordbox_xml(tracks: &[AnalyzedTrack], output_path: &Path) -> Resu
         Some(schema::XML_ENCODING),
         None,
     )))
-    .map_err(|e| write_error(output_path, e))?;
+    .map_err(|e| cleanup_and_error(format!("XML write error: {}", e)))?;
 
     // Root element: DJ_PLAYLISTS
     let mut root = BytesStart::new("DJ_PLAYLISTS");
     root.push_attribute(("Version", schema::PLAYLISTS_VERSION));
     xml.write_event(Event::Start(root))
-        .map_err(|e| write_error(output_path, e))?;
+        .map_err(|e| cleanup_and_error(format!("XML write error: {}", e)))?;
 
     // PRODUCT element
     let mut product = BytesStart::new("PRODUCT");
     product.push_attribute(("Name", schema::PRODUCT_NAME));
     product.push_attribute(("Version", schema::PRODUCT_VERSION));
     xml.write_event(Event::Empty(product))
-        .map_err(|e| write_error(output_path, e))?;
+        .map_err(|e| cleanup_and_error(format!("XML write error: {}", e)))?;
 
     // COLLECTION element
     let mut collection = BytesStart::new("COLLECTION");
     collection.push_attribute(("Entries", tracks.len().to_string().as_str()));
     xml.write_event(Event::Start(collection))
-        .map_err(|e| write_error(output_path, e))?;
+        .map_err(|e| cleanup_and_error(format!("XML write error: {}", e)))?;
 
     // Write each track
     for track in tracks {
-        write_track(&mut xml, track, output_path)?;
+        write_track(&mut xml, track, &temp_path).map_err(|e| {
+            let _ = std::fs::remove_file(&temp_path);
+            e
+        })?;
     }
 
     // Close COLLECTION
     xml.write_event(Event::End(BytesEnd::new("COLLECTION")))
-        .map_err(|e| write_error(output_path, e))?;
+        .map_err(|e| cleanup_and_error(format!("XML write error: {}", e)))?;
 
     // PLAYLISTS section (with import workaround playlist)
-    write_playlists(&mut xml, tracks, output_path)?;
+    write_playlists(&mut xml, tracks, &temp_path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path);
+        e
+    })?;
 
     // Close DJ_PLAYLISTS
     xml.write_event(Event::End(BytesEnd::new("DJ_PLAYLISTS")))
-        .map_err(|e| write_error(output_path, e))?;
+        .map_err(|e| cleanup_and_error(format!("XML write error: {}", e)))?;
+
+    // Flush and drop the writer before rename
+    drop(xml);
+
+    // Atomic rename: either succeeds completely or fails without modifying target
+    std::fs::rename(&temp_path, output_path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp_path);
+        DjprepError::OutputError {
+            path: output_path.to_path_buf(),
+            reason: format!("Failed to finalize file: {}", e),
+        }
+    })?;
 
     info!("Wrote {} tracks to {}", tracks.len(), output_path.display());
 

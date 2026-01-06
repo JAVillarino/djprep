@@ -492,6 +492,10 @@ fn stem_worker(
     }
 }
 
+/// Minimum audio duration in seconds required for reliable analysis
+/// stratum-dsp needs at least 3-5 seconds for BPM/key detection
+const MIN_AUDIO_DURATION_SECS: f64 = 3.0;
+
 /// Analyze a single file
 fn analyze_single_file(
     file: &DiscoveredFile,
@@ -506,11 +510,40 @@ fn analyze_single_file(
     // Decode audio
     let buffer = audio::decode(&file.path)?;
 
+    // Validate minimum duration for reliable analysis
+    if buffer.duration < MIN_AUDIO_DURATION_SECS {
+        return Err(DjprepError::AnalysisError {
+            path: file.path.clone(),
+            reason: format!(
+                "Audio too short ({:.1}s). Minimum {:.0}s required for reliable BPM/key detection.",
+                buffer.duration, MIN_AUDIO_DURATION_SECS
+            ),
+        });
+    }
+
     // Run BPM detection
-    let bpm = bpm_detector.detect(&buffer)?;
+    let bpm = bpm_detector.detect(&buffer).map_err(|e| {
+        // Add file context to analysis errors
+        match e {
+            DjprepError::AnalysisError { reason, .. } => DjprepError::AnalysisError {
+                path: file.path.clone(),
+                reason,
+            },
+            other => other,
+        }
+    })?;
 
     // Run key detection
-    let key = key_detector.detect(&buffer)?;
+    let key = key_detector.detect(&buffer).map_err(|e| {
+        // Add file context to analysis errors
+        match e {
+            DjprepError::AnalysisError { reason, .. } => DjprepError::AnalysisError {
+                path: file.path.clone(),
+                reason,
+            },
+            other => other,
+        }
+    })?;
 
     // Create analyzed track
     let mut track = AnalyzedTrack::new(file.path.clone(), track_id);

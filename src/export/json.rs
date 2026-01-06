@@ -102,10 +102,16 @@ pub struct StemsJson {
 }
 
 /// Write analyzed tracks to a JSON file
+///
+/// Uses atomic write pattern: writes to a temp file first, then renames.
+/// This prevents data corruption if the write is interrupted.
 pub fn write_json(tracks: &[AnalyzedTrack], output_path: &Path) -> Result<()> {
-    let file = File::create(output_path).map_err(|e| DjprepError::OutputError {
+    // Write to temp file in same directory (ensures same filesystem for atomic rename)
+    let temp_path = output_path.with_extension("json.tmp");
+
+    let file = File::create(&temp_path).map_err(|e| DjprepError::OutputError {
         path: output_path.to_path_buf(),
-        reason: e.to_string(),
+        reason: format!("Failed to create temp file: {}", e),
     })?;
 
     let writer = BufWriter::new(file);
@@ -120,9 +126,23 @@ pub fn write_json(tracks: &[AnalyzedTrack], output_path: &Path) -> Result<()> {
         tracks: tracks.iter().map(track_to_json).collect(),
     };
 
-    serde_json::to_writer_pretty(writer, &output).map_err(|e| DjprepError::OutputError {
-        path: output_path.to_path_buf(),
-        reason: e.to_string(),
+    serde_json::to_writer_pretty(writer, &output).map_err(|e| {
+        // Clean up temp file on error
+        let _ = std::fs::remove_file(&temp_path);
+        DjprepError::OutputError {
+            path: output_path.to_path_buf(),
+            reason: e.to_string(),
+        }
+    })?;
+
+    // Atomic rename: either succeeds completely or fails without modifying target
+    std::fs::rename(&temp_path, output_path).map_err(|e| {
+        // Clean up temp file on error
+        let _ = std::fs::remove_file(&temp_path);
+        DjprepError::OutputError {
+            path: output_path.to_path_buf(),
+            reason: format!("Failed to finalize file: {}", e),
+        }
     })?;
 
     info!("Wrote {} tracks to {}", tracks.len(), output_path.display());

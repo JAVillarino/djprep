@@ -183,10 +183,39 @@ pub fn ensure_model(config: &ModelConfig) -> Result<PathBuf> {
 }
 
 /// Download the model from URL with progress indicator
+///
+/// Uses atomic download pattern to prevent race conditions:
+/// 1. Download to a temp file with a unique suffix
+/// 2. Verify hash
+/// 3. Atomically rename to final destination
+///
+/// This ensures that partial downloads never corrupt the model file,
+/// and concurrent download attempts don't interfere with each other.
 #[cfg(feature = "stems")]
 fn download_model(config: &ModelConfig, dest_path: &PathBuf) -> Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
     use std::io::{Read, Write};
+
+    // Use process ID and timestamp for unique temp file name
+    // This prevents race conditions when multiple processes download concurrently
+    let temp_suffix = format!(
+        ".download.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let temp_path = dest_path.with_extension(format!(
+        "{}{}",
+        dest_path.extension().and_then(|e| e.to_str()).unwrap_or(""),
+        temp_suffix
+    ));
+
+    // Cleanup helper for error cases
+    let cleanup_temp = || {
+        let _ = fs::remove_file(&temp_path);
+    };
 
     let response = reqwest::blocking::get(config.url).map_err(|e| {
         DjprepError::ModelDownloadError {
@@ -215,10 +244,10 @@ fn download_model(config: &ModelConfig, dest_path: &PathBuf) -> Result<()> {
     );
     pb.set_message("Downloading HTDemucs model...");
 
-    // Create output file
-    let mut file = fs::File::create(dest_path).map_err(|e| DjprepError::OutputError {
+    // Create temp output file
+    let mut file = fs::File::create(&temp_path).map_err(|e| DjprepError::OutputError {
         path: dest_path.clone(),
-        reason: format!("Failed to create model file: {}", e),
+        reason: format!("Failed to create temp model file: {}", e),
     })?;
 
     // Stream download with progress updates
@@ -228,6 +257,7 @@ fn download_model(config: &ModelConfig, dest_path: &PathBuf) -> Result<()> {
 
     loop {
         let bytes_read = reader.read(&mut buffer).map_err(|e| {
+            cleanup_temp();
             DjprepError::ModelDownloadError {
                 reason: format!("Failed to read model data: {}", e),
             }
@@ -238,25 +268,49 @@ fn download_model(config: &ModelConfig, dest_path: &PathBuf) -> Result<()> {
         }
 
         file.write_all(&buffer[..bytes_read])
-            .map_err(|e| DjprepError::OutputError {
-                path: dest_path.clone(),
-                reason: format!("Failed to write model file: {}", e),
+            .map_err(|e| {
+                cleanup_temp();
+                DjprepError::OutputError {
+                    path: dest_path.clone(),
+                    reason: format!("Failed to write model file: {}", e),
+                }
             })?;
 
         downloaded += bytes_read as u64;
         pb.set_position(downloaded);
     }
 
-    pb.finish_with_message("Download complete!");
-    info!("Model downloaded to {}", dest_path.display());
+    // Ensure all data is written to disk before verification
+    file.sync_all().map_err(|e| {
+        cleanup_temp();
+        DjprepError::OutputError {
+            path: dest_path.clone(),
+            reason: format!("Failed to sync model file: {}", e),
+        }
+    })?;
+    drop(file);
 
-    // Verify hash after download
-    if !verify_model_hash(dest_path, config.sha256)? {
-        fs::remove_file(dest_path).ok();
+    pb.finish_with_message("Download complete, verifying...");
+
+    // Verify hash before atomic rename
+    if !verify_model_hash(&temp_path, config.sha256)? {
+        cleanup_temp();
         return Err(DjprepError::ModelDownloadError {
             reason: "Downloaded model hash verification failed".to_string(),
         });
     }
+
+    // Atomic rename: if dest already exists (from another process), this is fine
+    // The rename will succeed atomically on Unix, or fail on Windows if locked
+    fs::rename(&temp_path, dest_path).map_err(|e| {
+        cleanup_temp();
+        DjprepError::OutputError {
+            path: dest_path.clone(),
+            reason: format!("Failed to finalize model file: {}", e),
+        }
+    })?;
+
+    info!("Model downloaded to {}", dest_path.display());
 
     Ok(())
 }

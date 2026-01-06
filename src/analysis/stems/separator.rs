@@ -428,7 +428,7 @@ impl OrtStemSeparator {
 
         // Reassemble stems using overlap-add
         info!("Reassembling stems...");
-        let stems = overlap_add(&stem_chunks, &config, total_samples);
+        let stems = overlap_add(&stem_chunks, &config, total_samples)?;
 
         // Write output WAV files
         info!("Writing stem files...");

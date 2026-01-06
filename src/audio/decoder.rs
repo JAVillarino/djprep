@@ -168,13 +168,24 @@ pub fn decode(path: &Path) -> Result<AudioBuffer> {
 
 /// Convert interleaved multi-channel audio to mono
 fn to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
+    // Handle edge cases that would cause division by zero or incorrect behavior
+    if channels == 0 {
+        return Vec::new();
+    }
     if channels == 1 {
         return samples.to_vec();
     }
 
     samples
         .chunks(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+        .map(|frame| {
+            // Use actual frame length to avoid division by zero on incomplete frames
+            if frame.is_empty() {
+                0.0
+            } else {
+                frame.iter().sum::<f32>() / frame.len() as f32
+            }
+        })
         .collect()
 }
 
@@ -440,6 +451,9 @@ pub fn decode_stereo(path: &Path) -> Result<StereoBuffer> {
 
 /// Downmix multi-channel audio to stereo
 fn downmix_to_stereo(samples: &[f32], channels: usize) -> Vec<f32> {
+    if channels == 0 {
+        return Vec::new();
+    }
     if channels <= 2 {
         return samples.to_vec();
     }
@@ -449,11 +463,11 @@ fn downmix_to_stereo(samples: &[f32], channels: usize) -> Vec<f32> {
     let mut stereo = Vec::with_capacity(num_frames * 2);
 
     for frame in samples.chunks(channels) {
-        // Average odd indices for left, even for right (or vice versa)
+        // Use safe accessors to avoid out-of-bounds on incomplete final frames
         // For 5.1 surround: FL, FR, FC, LFE, BL, BR
         // Simple approach: mix front channels
-        let left = if channels >= 1 { frame[0] } else { 0.0 };
-        let right = if channels >= 2 { frame[1] } else { left };
+        let left = frame.first().copied().unwrap_or(0.0);
+        let right = frame.get(1).copied().unwrap_or(left);
 
         stereo.push(left);
         stereo.push(right);
@@ -536,5 +550,71 @@ mod tests {
         let samples: Vec<f32> = (0..100).map(|i| i as f32 / 100.0).collect();
         let result = resample_linear_fallback(&samples, 44100, 22050);
         assert!((result.len() as f64 - 50.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn test_to_mono_zero_channels() {
+        // Zero channels should return empty vec (not panic)
+        let samples = vec![0.5, 0.8, 1.0];
+        let result = to_mono(&samples, 0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_to_mono_incomplete_frame() {
+        // Incomplete frame at end should be handled gracefully
+        let samples = vec![0.5, 0.3, 0.8, 0.2, 0.7]; // 5 samples, 2 channels = incomplete last frame
+        let result = to_mono(&samples, 2);
+        assert_eq!(result.len(), 3); // 2 complete frames + 1 incomplete
+        assert!((result[0] - 0.4).abs() < 0.001);
+        assert!((result[1] - 0.5).abs() < 0.001);
+        assert!((result[2] - 0.7).abs() < 0.001); // Single sample in last frame
+    }
+
+    #[test]
+    fn test_to_mono_empty_input() {
+        let result = to_mono(&[], 2);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_downmix_to_stereo_zero_channels() {
+        // Zero channels should return empty vec (not panic)
+        let samples = vec![0.5, 0.8, 1.0];
+        let result = downmix_to_stereo(&samples, 0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_downmix_to_stereo_incomplete_frame() {
+        // 6-channel audio with incomplete last frame
+        let samples = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]; // 8 samples, 6 channels
+        let result = downmix_to_stereo(&samples, 6);
+        // First complete frame: left=0.1, right=0.2
+        assert_eq!(result.len(), 4); // 1 complete frame + 1 incomplete
+        assert!((result[0] - 0.1).abs() < 0.001);
+        assert!((result[1] - 0.2).abs() < 0.001);
+        // Incomplete frame: only 2 samples [0.7, 0.8]
+        assert!((result[2] - 0.7).abs() < 0.001);
+        assert!((result[3] - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_downmix_to_stereo_surround() {
+        // 6-channel (5.1) surround: FL, FR, FC, LFE, BL, BR
+        let frame = vec![0.5, 0.3, 0.1, 0.0, 0.2, 0.4];
+        let result = downmix_to_stereo(&frame, 6);
+        assert_eq!(result.len(), 2);
+        // Should extract FL and FR
+        assert!((result[0] - 0.5).abs() < 0.001);
+        assert!((result[1] - 0.3).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_downmix_to_stereo_passthrough() {
+        // 2 channels should pass through unchanged
+        let samples = vec![0.5, 0.3, 0.8, 0.2];
+        let result = downmix_to_stereo(&samples, 2);
+        assert_eq!(result, samples);
     }
 }

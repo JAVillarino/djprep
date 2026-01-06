@@ -35,6 +35,7 @@
 //! ```
 //! where `t` ranges from 0 to 1 across the overlap zone.
 
+use crate::error::{DjprepError, Result};
 use crate::types::StereoBuffer;
 
 /// HTDemucs v4 maximum segment length in seconds
@@ -188,12 +189,18 @@ struct StemSample {
 ///
 /// Uses array-of-structs layout for better cache locality: all stem data for a single
 /// sample position is stored contiguously, reducing cache misses during the inner loop.
-pub fn overlap_add(chunks: &[StemChunk], config: &ChunkConfig, total_samples: usize) -> FourStems {
+///
+/// # Errors
+///
+/// Returns an error if `chunks` is empty (no stems to reassemble).
+pub fn overlap_add(chunks: &[StemChunk], config: &ChunkConfig, total_samples: usize) -> Result<FourStems> {
     // Require at least one chunk to determine sample rate
     let sample_rate = chunks
         .first()
         .map(|c| c.vocals.sample_rate)
-        .expect("overlap_add requires at least one chunk");
+        .ok_or_else(|| DjprepError::StemUnavailable {
+            reason: "No stem chunks to reassemble (overlap_add requires at least one chunk)".to_string(),
+        })?;
 
     // Use array-of-structs for cache locality: all stems for sample i are adjacent
     let mut output = vec![StemSample::default(); total_samples];
@@ -258,12 +265,12 @@ pub fn overlap_add(chunks: &[StemChunk], config: &ChunkConfig, total_samples: us
         other_right.push(s.other_r * inv_w);
     }
 
-    FourStems {
+    Ok(FourStems {
         vocals: StereoBuffer::new(vocals_left, vocals_right, sample_rate),
         drums: StereoBuffer::new(drums_left, drums_right, sample_rate),
         bass: StereoBuffer::new(bass_left, bass_right, sample_rate),
         other: StereoBuffer::new(other_left, other_right, sample_rate),
-    }
+    })
 }
 
 /// Generate crossfade weights for a chunk
@@ -378,7 +385,7 @@ mod tests {
             other: StereoBuffer::new(vec![0.2; chunk_len], vec![0.1; chunk_len], 44100),
         };
 
-        let result = overlap_add(&[chunk], &config, chunk_len);
+        let result = overlap_add(&[chunk], &config, chunk_len).unwrap();
 
         // With single chunk, values should be unchanged
         assert_eq!(result.vocals.left.len(), chunk_len);
@@ -404,7 +411,7 @@ mod tests {
             other: StereoBuffer::new(vec![0.0; chunk_len], vec![0.0; chunk_len], 48000),
         };
 
-        let result = overlap_add(&[chunk], &config, chunk_len);
+        let result = overlap_add(&[chunk], &config, chunk_len).unwrap();
 
         // Sample rate should be preserved from chunks
         assert_eq!(result.vocals.sample_rate, 48000);
@@ -412,9 +419,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "overlap_add requires at least one chunk")]
-    fn test_overlap_add_empty_chunks_panics() {
+    fn test_overlap_add_empty_chunks_returns_error() {
         let config = ChunkConfig::htdemucs();
-        let _ = overlap_add(&[], &config, 1000);
+        let result = overlap_add(&[], &config, 1000);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("No stem chunks"));
     }
 }
