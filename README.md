@@ -243,6 +243,10 @@ djprep outputs musical keys in multiple notations:
 | Fm       | 4A      | 4m       | F minor     |
 | G#       | 4B      | 4d       | G# major    |
 
+Open Key is an alternate harmonic-mixing notation equivalent to Camelot:
+- Camelot `A` (minor) maps to Open Key `m`
+- Camelot `B` (major) maps to Open Key `d`
+
 **Harmonic Mixing Tip:** Keys that are adjacent on the Camelot wheel (e.g., 8A to 7A or 9A) or share the same number (8A to 8B) mix harmonically.
 
 ## Stem Separation
