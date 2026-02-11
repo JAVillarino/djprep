@@ -4,15 +4,22 @@
 
 ## Project Overview
 
-djprep is a CLI tool that analyzes audio files (MP3, WAV, FLAC, AIFF) to extract BPM, musical key, and optionally separate stems. It outputs Rekordbox-compatible XML for import into Pioneer DJ software, plus a JSON sidecar for interoperability.
+djprep is a Rust workspace for DJ audio analysis:
+
+- `djprep-core`: reusable analysis library (native + WebAssembly)
+- `djprep-cli`: CLI app for discovery, batch processing, stems, and export
+
+It analyzes audio files (MP3, WAV, FLAC, AIFF) to extract BPM and key, optionally separates stems, and outputs Rekordbox-compatible XML plus a JSON sidecar.
 
 **Core value proposition:** Free, open-source alternative to Mixed In Key with stem separation capabilities.
 
+**Demo + architecture notes:** https://www.joelvillarino.com/work/projects/djprep
+
 ---
 
-## Current Project State (January 2026)
+## Current Project State (February 2026)
 
-The project is **feature-complete** and ready for v0.1.0 release:
+The project is **feature-complete** and shipped as a workspace split:
 
 | Component | Status | Notes |
 |-----------|--------|-------|
@@ -29,7 +36,9 @@ The project is **feature-complete** and ready for v0.1.0 release:
 | Error Handling | ✅ Complete | Actionable error messages with suggestions |
 | Concurrency | ✅ Complete | Bounded channel queue for stem backpressure |
 | Incremental Analysis | ✅ Complete | Skips already-analyzed files (--force to override) |
-| Tests | ✅ Complete | 38 unit + 13 integration + 2 doc tests |
+| `djprep-core` | ✅ Complete | Shared analysis crate with native + wasm targets |
+| `djprep-cli` | ✅ Complete | CLI orchestration, stems, exports |
+| Tests | ✅ Complete | Unit + integration + doc tests |
 
 **All Phase 5 (Polish) items complete:**
 - ✅ Metadata extraction (ID3/Vorbis tags)
@@ -58,7 +67,7 @@ Add Serato export format support.
 
 Requirements:
 - Research Serato crate file format
-- Create src/export/serato.rs module
+- Create `djprep-cli/src/export/serato.rs` module
 - Add --format serato CLI option
 - Test with real Serato installation if possible
 ```
@@ -146,44 +155,27 @@ pub struct StemPaths {
 Current directory structure:
 
 ```
-src/
-├── main.rs                 # Entry point, CLI setup
-├── lib.rs                  # Public API, re-exports
-├── error.rs                # Error types (thiserror)
-├── types.rs                # Core data types (AnalyzedTrack, BpmResult, KeyResult, etc.)
-│
-├── config/
-│   ├── mod.rs
-│   └── settings.rs         # Settings struct, CLI parsing
-│
-├── discovery/
-│   └── mod.rs              # walkdir file discovery, track ID generation
-│
-├── audio/
-│   ├── mod.rs
-│   └── decoder.rs          # symphonia decoding (22050Hz mono + 44100Hz stereo)
-│
-├── analysis/
-│   ├── mod.rs
-│   ├── traits.rs           # BpmDetector, KeyDetector, StemSeparator traits
-│   ├── stratum.rs          # stratum-dsp BPM/Key implementation
-│   ├── camelot.rs          # Key to Camelot notation mapping
-│   ├── metadata.rs         # ID3/Vorbis tag extraction via lofty
-│   └── stems/
-│       ├── mod.rs
-│       ├── model.rs        # ONNX model download/cache
-│       ├── separator.rs    # OrtStemSeparator - ort session management
-│       ├── stft.rs         # STFT/ISTFT preprocessing (rustfft)
-│       └── chunking.rs     # Audio chunking with overlap-add
-│
-├── pipeline/
-│   ├── mod.rs
-│   └── orchestrator.rs     # Batch processing with bounded channel queue
-│
-└── export/
-    ├── mod.rs
-    ├── rekordbox.rs        # XML generation (streaming)
-    └── json.rs             # JSON sidecar export
+djprep/
+├── djprep-core/
+│   └── src/
+│       ├── lib.rs          # Core public API
+│       ├── analysis/       # BPM/key analysis backends
+│       ├── audio/          # Byte decoding (feature-gated)
+│       ├── camelot.rs      # Camelot/Open Key mapping
+│       ├── types.rs        # Core analysis types
+│       ├── error.rs        # CoreError definitions
+│       └── wasm.rs         # wasm-bindgen bindings
+├── djprep-cli/
+│   └── src/
+│       ├── main.rs         # CLI entrypoint
+│       ├── pipeline/       # Orchestration + parallel processing
+│       ├── discovery/      # walkdir scanning, track ID generation
+│       ├── analysis/stems/ # ONNX stem separation (feature `stems`)
+│       ├── export/         # Rekordbox XML + JSON exporters
+│       ├── audio/          # CLI decode helpers for stems path
+│       ├── types.rs        # CLI-specific track/path types
+│       └── error.rs        # DjprepError definitions
+└── docs/
 ```
 
 ---
@@ -622,7 +614,7 @@ Areas to investigate:
 ### Do's
 1. **Read CLAUDE.md first** - This file contains all architectural decisions
 2. **Test incrementally** - `cargo run` and `cargo check` after each change
-3. **Use existing patterns** - Look at StratumBpmDetector in src/analysis/stratum.rs
+3. **Use existing patterns** - Look at `djprep-core/src/analysis/mod.rs` and `djprep-cli/src/pipeline/orchestrator.rs`
 4. **Check compilation** - Run `cargo check` before claiming code is complete
 5. **Handle errors** - Use `?` operator, don't unwrap() in library code
 6. **Feature-gate stem code** - Use `#[cfg(feature = "stems")]` for ort/rustfft code
@@ -639,23 +631,23 @@ Areas to investigate:
 cargo check
 
 # Check with stems feature
-cargo check --features stems
+cargo check -p djprep --features stems
 
 # Run with verbose logging
-RUST_LOG=debug cargo run -- -i ./test -o ./out
+RUST_LOG=debug cargo run -p djprep -- -i ./test -o ./out
 
 # Run with stems enabled (model auto-downloads on first run)
-cargo run --features stems -- -i ./test -o ./out --stems
+cargo run -p djprep --features stems -- -i ./test -o ./out --stems
 
 # Run all tests
 cargo test
 
 # Run tests with stems feature
-cargo test --features stems
+cargo test -p djprep --features stems
 
 # Check for issues
 cargo clippy
-cargo clippy --features stems
+cargo clippy -p djprep --features stems
 
 # Format code
 cargo fmt
@@ -663,13 +655,13 @@ cargo fmt
 
 ### Key Files to Understand
 ```
-src/analysis/traits.rs       # Trait definitions (BpmDetector, KeyDetector, StemSeparator)
-src/analysis/stratum.rs      # BPM/Key detection implementation
-src/analysis/stems/model.rs  # Model auto-download and caching
-src/analysis/stems/separator.rs  # Stem separation with ort
-src/pipeline/orchestrator.rs # Main pipeline with bounded channel queue
-src/types.rs                 # Data structures (AnalyzedTrack, BpmResult, KeyResult)
-src/error.rs                 # Error types (DjprepError enum)
+djprep-core/src/analysis/mod.rs                # Core BPM/key analysis backends
+djprep-core/src/wasm.rs                        # wasm-bindgen interface
+djprep-cli/src/analysis/stems/model.rs         # Model auto-download and caching
+djprep-cli/src/analysis/stems/separator.rs     # Stem separation with ort
+djprep-cli/src/pipeline/orchestrator.rs        # Main pipeline with bounded queue
+djprep-cli/src/types.rs                        # CLI track/path data structures
+djprep-cli/src/error.rs                        # DjprepError enum
 ```
 
 When stuck on Rust specifics (ownership, lifetimes, traits), ask for help. When stuck on architecture decisions, refer back to this document.

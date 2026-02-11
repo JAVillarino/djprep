@@ -4,6 +4,16 @@ High-performance audio analysis for DJs. Extracts BPM, musical key, and stems fr
 
 **djprep** is a free, open-source alternative to Mixed In Key with stem separation capabilities.
 
+The project is structured as a Rust workspace:
+- `djprep-core` for reusable analysis logic (native + WebAssembly)
+- `djprep-cli` for file discovery, batch orchestration, stems, and export
+
+## Live Demo + Additional Insights
+
+Try the browser demo and read architecture decisions here:
+
+- https://www.joelvillarino.com/work/projects/djprep
+
 ## Features
 
 - **BPM Detection** - Accurate tempo analysis with confidence scoring and double-tempo correction
