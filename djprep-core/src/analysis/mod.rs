@@ -31,11 +31,11 @@ pub fn detect_bpm(buffer: &AudioBuffer) -> Result<BpmResult> {
 
         let candidates = vec![(bpm / 2.0, confidence * 0.5), (bpm * 2.0, confidence * 0.5)];
 
-        return Ok(BpmResult {
+        Ok(BpmResult {
             value: bpm,
             confidence,
             candidates,
-        });
+        })
     }
 
     #[cfg(all(not(feature = "analysis-stratum"), feature = "analysis-lite"))]
@@ -77,13 +77,13 @@ pub fn detect_key(buffer: &AudioBuffer) -> Result<KeyResult> {
         let open_key_str = camelot::to_open_key(pitch_class, mode).to_string();
         let confidence = result.key_confidence as f64;
 
-        return Ok(KeyResult {
+        Ok(KeyResult {
             pitch_class,
             mode,
             camelot: camelot_str,
             open_key: open_key_str,
             confidence,
-        });
+        })
     }
 
     #[cfg(all(not(feature = "analysis-stratum"), feature = "analysis-lite"))]
@@ -119,7 +119,7 @@ pub fn analyze_audio_bytes(
     #[cfg(feature = "decode")]
     {
         let buffer = crate::audio::decode_bytes(audio_bytes, hint_extension)?;
-        return analyze_audio_buffer(&buffer);
+        analyze_audio_buffer(&buffer)
     }
 
     #[cfg(not(feature = "decode"))]
@@ -139,7 +139,7 @@ pub fn analyze_audio_owned(
     #[cfg(feature = "decode")]
     {
         let buffer = crate::audio::decode_owned(audio_bytes, hint_extension)?;
-        return analyze_audio_buffer(&buffer);
+        analyze_audio_buffer(&buffer)
     }
 
     #[cfg(not(feature = "decode"))]
