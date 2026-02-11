@@ -400,7 +400,10 @@ fn analyze_files(
                             }
                             Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
                                 // Stem worker has shut down, channel closed
-                                debug!("Stem channel closed, skipping stems for {}", file.path.display());
+                                debug!(
+                                    "Stem channel closed, skipping stems for {}",
+                                    file.path.display()
+                                );
                             }
                         }
                     }

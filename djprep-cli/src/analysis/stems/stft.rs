@@ -115,7 +115,11 @@ impl StftProcessor {
     }
 
     /// Compute inverse STFT to reconstruct audio
-    pub fn compute_istft(&mut self, spectrogram: &StereoSpectrogram, output_length: usize) -> StereoBuffer {
+    pub fn compute_istft(
+        &mut self,
+        spectrogram: &StereoSpectrogram,
+        output_length: usize,
+    ) -> StereoBuffer {
         let left = self.istft_channel(&spectrogram.left, output_length);
         let right = self.istft_channel(&spectrogram.right, output_length);
 
@@ -123,7 +127,11 @@ impl StftProcessor {
     }
 
     /// Compute inverse STFT for a single channel
-    fn istft_channel(&mut self, spectrogram: &[Vec<Complex<f32>>], output_length: usize) -> Vec<f32> {
+    fn istft_channel(
+        &mut self,
+        spectrogram: &[Vec<Complex<f32>>],
+        output_length: usize,
+    ) -> Vec<f32> {
         let mut output = vec![0.0f32; output_length];
         let mut window_sum = vec![0.0f32; output_length];
 

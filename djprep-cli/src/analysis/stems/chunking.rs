@@ -145,7 +145,9 @@ pub fn chunk_audio(audio: &StereoBuffer, config: &ChunkConfig) -> Vec<AudioChunk
 
     while start < total_samples {
         // Use saturating arithmetic to prevent overflow
-        let end = start.saturating_add(config.chunk_samples).min(total_samples);
+        let end = start
+            .saturating_add(config.chunk_samples)
+            .min(total_samples);
 
         // Extract chunk samples
         let left: Vec<f32> = audio.left[start..end].to_vec();
@@ -199,13 +201,18 @@ struct StemSample {
 /// # Errors
 ///
 /// Returns an error if `chunks` is empty (no stems to reassemble).
-pub fn overlap_add(chunks: &[StemChunk], config: &ChunkConfig, total_samples: usize) -> Result<FourStems> {
+pub fn overlap_add(
+    chunks: &[StemChunk],
+    config: &ChunkConfig,
+    total_samples: usize,
+) -> Result<FourStems> {
     // Require at least one chunk to determine sample rate
     let sample_rate = chunks
         .first()
         .map(|c| c.vocals.sample_rate)
         .ok_or_else(|| DjprepError::StemUnavailable {
-            reason: "No stem chunks to reassemble (overlap_add requires at least one chunk)".to_string(),
+            reason: "No stem chunks to reassemble (overlap_add requires at least one chunk)"
+                .to_string(),
         })?;
 
     // Use array-of-structs for cache locality: all stems for sample i are adjacent
@@ -220,7 +227,8 @@ pub fn overlap_add(chunks: &[StemChunk], config: &ChunkConfig, total_samples: us
         let is_last = chunk.index == num_chunks.saturating_sub(1);
 
         // Generate crossfade weights for this chunk
-        let weights = generate_crossfade_weights(chunk_len, config.overlap_samples, is_first, is_last);
+        let weights =
+            generate_crossfade_weights(chunk_len, config.overlap_samples, is_first, is_last);
 
         // Validate chunk buffers match expected length to prevent index out of bounds
         if chunk.vocals.left.len() < chunk_len

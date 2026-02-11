@@ -316,9 +316,13 @@ impl OrtStemSeparator {
                 })?;
 
             // Get input name from session - fail explicitly if model has no inputs
-            let input_info = session.inputs.first().ok_or_else(|| DjprepError::StemUnavailable {
-                reason: "Model has no input tensors defined".to_string(),
-            })?;
+            let input_info =
+                session
+                    .inputs
+                    .first()
+                    .ok_or_else(|| DjprepError::StemUnavailable {
+                        reason: "Model has no input tensors defined".to_string(),
+                    })?;
             let input_name = input_info.name.clone();
 
             // Run inference
@@ -363,8 +367,7 @@ impl OrtStemSeparator {
                 return Err(DjprepError::StemUnavailable {
                     reason: format!(
                         "Expected batch size 1, got {} (shape {:?})",
-                        shape[0],
-                        shape
+                        shape[0], shape
                     ),
                 });
             }
@@ -372,8 +375,7 @@ impl OrtStemSeparator {
                 return Err(DjprepError::StemUnavailable {
                     reason: format!(
                         "Expected 4 stems (vocals/drums/bass/other), got {} (shape {:?})",
-                        shape[1],
-                        shape
+                        shape[1], shape
                     ),
                 });
             }
@@ -381,8 +383,7 @@ impl OrtStemSeparator {
                 return Err(DjprepError::StemUnavailable {
                     reason: format!(
                         "Expected 2 channels (stereo), got {} (shape {:?})",
-                        shape[2],
-                        shape
+                        shape[2], shape
                     ),
                 });
             }
@@ -410,10 +411,7 @@ impl OrtStemSeparator {
                 .checked_mul(num_channels)
                 .and_then(|v| v.checked_mul(output_samples))
                 .ok_or_else(|| DjprepError::StemUnavailable {
-                    reason: format!(
-                        "ONNX shape {:?} would overflow memory calculation",
-                        shape
-                    ),
+                    reason: format!("ONNX shape {:?} would overflow memory calculation", shape),
                 })?;
 
             if output_data.len() != expected_len {
@@ -435,36 +433,42 @@ impl OrtStemSeparator {
             //   stem1_left[2N..3N], stem1_right[3N..4N], ...
             // We verified contiguity above via length check.
             // Extract stem closure returns Result to handle corrupted model output gracefully
-            let extract_stem = |stem_idx: usize| -> Result<StereoBuffer> {
-                // Use checked arithmetic to prevent overflow
-                let stem_offset = stem_idx.saturating_mul(num_channels).saturating_mul(output_samples);
-                let left_start = stem_offset;
-                let right_start = stem_offset.saturating_add(output_samples);
+            let extract_stem =
+                |stem_idx: usize| -> Result<StereoBuffer> {
+                    // Use checked arithmetic to prevent overflow
+                    let stem_offset = stem_idx
+                        .saturating_mul(num_channels)
+                        .saturating_mul(output_samples);
+                    let left_start = stem_offset;
+                    let right_start = stem_offset.saturating_add(output_samples);
 
-                // Validate bounds - return error instead of panicking on corrupted model output
-                // This allows graceful degradation: skip this file's stems instead of crashing
-                if left_start.saturating_add(output_samples) > output_data.len() {
-                    return Err(DjprepError::StemUnavailable {
-                        reason: format!(
-                            "Left channel bounds check failed for stem {}: offset {} + {} > {}",
-                            stem_idx, left_start, output_samples, output_data.len()
-                        ),
-                    });
-                }
-                if right_start.saturating_add(output_samples) > output_data.len() {
-                    return Err(DjprepError::StemUnavailable {
-                        reason: format!(
+                    // Validate bounds - return error instead of panicking on corrupted model output
+                    // This allows graceful degradation: skip this file's stems instead of crashing
+                    if left_start.saturating_add(output_samples) > output_data.len() {
+                        return Err(DjprepError::StemUnavailable {
+                            reason: format!(
+                                "Left channel bounds check failed for stem {}: offset {} + {} > {}",
+                                stem_idx,
+                                left_start,
+                                output_samples,
+                                output_data.len()
+                            ),
+                        });
+                    }
+                    if right_start.saturating_add(output_samples) > output_data.len() {
+                        return Err(DjprepError::StemUnavailable {
+                            reason: format!(
                             "Right channel bounds check failed for stem {}: offset {} + {} > {}",
                             stem_idx, right_start, output_samples, output_data.len()
                         ),
-                    });
-                }
+                        });
+                    }
 
-                let left = output_data[left_start..left_start + output_samples].to_vec();
-                let right = output_data[right_start..right_start + output_samples].to_vec();
+                    let left = output_data[left_start..left_start + output_samples].to_vec();
+                    let right = output_data[right_start..right_start + output_samples].to_vec();
 
-                Ok(StereoBuffer::new(left, right, chunk.audio.sample_rate))
-            };
+                    Ok(StereoBuffer::new(left, right, chunk.audio.sample_rate))
+                };
 
             stem_chunks.push(StemChunk {
                 index: chunk.index,

@@ -103,7 +103,10 @@ pub fn decode_stereo(path: &Path) -> Result<StereoBuffer> {
     let codec_params = track.codec_params.clone();
 
     let source_sample_rate = codec_params.sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE);
-    let channels = codec_params.channels.map(|c| c.count()).unwrap_or(DEFAULT_CHANNELS);
+    let channels = codec_params
+        .channels
+        .map(|c| c.count())
+        .unwrap_or(DEFAULT_CHANNELS);
 
     debug!(
         "Decoding stereo: {} @ {}Hz, {} channels",

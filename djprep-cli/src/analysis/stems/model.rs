@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 const ENV_MODEL_PATH: &str = "DJPREP_MODEL_PATH";
 
 // I/O buffer size for download and hash verification
+#[cfg(feature = "stems")]
 const IO_BUFFER_SIZE: usize = 8192;
 
 // ProjectDirs identifiers
@@ -105,7 +106,11 @@ pub fn find_model_path() -> Result<PathBuf> {
 
     // 5. Check home directory
     if let Some(base_dirs) = directories::BaseDirs::new() {
-        let home_path = base_dirs.home_dir().join(PROJECT_APP).join(MODELS_SUBDIR).join(filename);
+        let home_path = base_dirs
+            .home_dir()
+            .join(PROJECT_APP)
+            .join(MODELS_SUBDIR)
+            .join(filename);
         if home_path.exists() {
             return Ok(home_path);
         }
@@ -144,9 +149,10 @@ pub fn find_model_path() -> Result<PathBuf> {
 
 /// Get the model cache directory
 pub fn get_cache_dir() -> Result<PathBuf> {
-    let proj_dirs = ProjectDirs::from(PROJECT_QUALIFIER, PROJECT_ORG, PROJECT_APP).ok_or_else(|| {
-        DjprepError::ConfigError("Could not determine cache directory".to_string())
-    })?;
+    let proj_dirs =
+        ProjectDirs::from(PROJECT_QUALIFIER, PROJECT_ORG, PROJECT_APP).ok_or_else(|| {
+            DjprepError::ConfigError("Could not determine cache directory".to_string())
+        })?;
 
     let cache_dir = proj_dirs.cache_dir().join(MODELS_SUBDIR);
     fs::create_dir_all(&cache_dir).map_err(|e| DjprepError::OutputError {
@@ -272,8 +278,8 @@ fn download_model(config: &ModelConfig, dest_path: &PathBuf) -> Result<()> {
         let _ = fs::remove_file(&temp_path);
     };
 
-    let response = reqwest::blocking::get(config.url).map_err(|e| {
-        DjprepError::ModelDownloadError {
+    let response =
+        reqwest::blocking::get(config.url).map_err(|e| DjprepError::ModelDownloadError {
             reason: format!("Failed to download model: {}", e),
         })?;
 
@@ -312,20 +318,20 @@ fn download_model(config: &ModelConfig, dest_path: &PathBuf) -> Result<()> {
             cleanup_temp();
             DjprepError::ModelDownloadError {
                 reason: format!("Failed to read model data: {}", e),
-            })?;
+            }
+        })?;
 
         if bytes_read == 0 {
             break;
         }
 
-        file.write_all(&buffer[..bytes_read])
-            .map_err(|e| {
-                cleanup_temp();
-                DjprepError::OutputError {
-                    path: dest_path.clone(),
-                    reason: format!("Failed to write model file: {}", e),
-                }
-            })?;
+        file.write_all(&buffer[..bytes_read]).map_err(|e| {
+            cleanup_temp();
+            DjprepError::OutputError {
+                path: dest_path.clone(),
+                reason: format!("Failed to write model file: {}", e),
+            }
+        })?;
 
         downloaded += bytes_read as u64;
         pb.set_position(downloaded);
