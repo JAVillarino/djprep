@@ -4,6 +4,49 @@
 
 *Initial research and design document for djprep – High-Performance Audio Analysis & Metadata Interchange System*
 
+## 0. Current Architecture (February 11, 2026)
+
+The repository is now a Cargo workspace with two crates:
+
+```text
+djprep/
+├── djprep-cli/   # Package name: djprep (binary + CLI pipeline)
+├── djprep-core/  # Shared analysis library (native + wasm)
+└── .github/workflows/ci.yml
+```
+
+### 0.1 Crate Responsibilities
+
+- `djprep-core`:
+  - Shared analysis domain types (`AudioBuffer`, `BpmResult`, `KeyResult`, key notations)
+  - Mono decoding from bytes/reader (feature-gated decode path)
+  - BPM/key analysis (default: stratum backend)
+  - wasm-bindgen bindings
+- `djprep-cli`:
+  - File discovery and path-based orchestration
+  - Metadata extraction, export, progress reporting
+  - Stem separation and model management
+
+### 0.2 WASM Profiles
+
+- Full profile:
+  - `wasm-pack build --target web djprep-core -- --features wasm`
+  - Includes byte decoding + stratum backend (`analyze_audio`, `analyzePcm`)
+- Lightweight profile:
+  - `wasm-pack build --target web djprep-core -- --no-default-features --features wasm-lite`
+  - Includes compact PCM API only (`analyzePcm`)
+  - Designed for browser demos with external decoding
+
+### 0.3 CI
+
+GitHub Actions now validates:
+
+- native workspace check/test
+- full wasm build
+- lightweight wasm build + gzip size budget check
+
+> The remainder of this document is the original architecture analysis and rationale.
+
 ## 1. Executive Summary
 This report presents a comprehensive architectural specification for djprep, a command-line interface (CLI) utility engineered to serve as a high-performance, open-source alternative to proprietary audio analysis tools such as "Mixed In Key." The primary objective of djprep is to perform batch analysis of digital audio files—specifically MP3, WAV, FLAC, and AIFF formats—to extract critical musical metadata including Beats Per Minute (BPM), Musical Key (Tonality), and Stem separation. A crucial requirement of this system is the capability to export this analyzed data into a standardized rekordbox.xml format, facilitating seamless integration with Pioneer DJ’s Rekordbox ecosystem, as well as a generic JSON format for interoperability with other systems.
 The proposed architecture leverages the Rust programming language to prioritize memory safety, thread-level parallelism, and zero-cost abstractions. Central to the design is the utilization of symphonia for pure-Rust audio decoding, rayon for data parallelism, and ort (ONNX Runtime) for deep learning inference required by stem separation. The report conducts a rigorous analysis of the Rekordbox XML schema, identifying critical constraints regarding 32-bit signed integer limits for Track IDs and the idiosyncrasies of URI encoding across Windows and POSIX systems. Furthermore, it addresses the significant challenge of "Octave Errors" in BPM detection through heuristic signal processing strategies and evaluates the trade-offs between Hybrid Transformer Demucs (HTDemucs) and MDX-Net architectures for stem separation. By resolving resource contention between CPU-bound DSP tasks and tensor-based inference, djprep aims to deliver professional-grade analysis speed and accuracy in a portable, single-binary distribution.

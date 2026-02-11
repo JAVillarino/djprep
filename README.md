@@ -14,6 +14,15 @@ High-performance audio analysis for DJs. Extracts BPM, musical key, and stems fr
 - **Batch Processing** - Analyze entire libraries with parallel processing
 - **Multiple Formats** - MP3, WAV, FLAC, and AIFF support
 
+## Workspace Layout
+
+```text
+djprep/
+├── djprep-cli/   # CLI app (file discovery, pipeline, export, stems)
+├── djprep-core/  # Shared analysis library (native + wasm)
+└── docs/
+```
+
 ## Installation
 
 ### Prerequisites
@@ -41,7 +50,27 @@ This enables the `--stems` flag and adds ONNX Runtime dependencies (~50MB larger
 ### Install to PATH
 
 ```bash
-cargo install --path .
+cargo install --path ./djprep-cli
+```
+
+## WebAssembly Builds
+
+Install `wasm-pack` once:
+
+```bash
+cargo install wasm-pack
+```
+
+Full web build (byte decoding + stratum backend, larger bundle):
+
+```bash
+wasm-pack build --target web djprep-core -- --features wasm
+```
+
+Lightweight web build (PCM input API, minimal bundle):
+
+```bash
+wasm-pack build --target web djprep-core -- --no-default-features --features wasm-lite
 ```
 
 ## Usage
@@ -297,9 +326,10 @@ djprep -i ./music --stems -o ./output
 ## Technical Details
 
 ### Analysis Engine
-- **BPM/Key Detection:** stratum-dsp 1.0 (pure Rust, no FFI dependencies)
+- **BPM/Key Detection (CLI + full WASM):** stratum-dsp 1.0 (pure Rust, no FFI dependencies)
 - **Sample Rate:** Audio resampled to 22,050 Hz mono for BPM/key analysis
 - **Thread Pool:** Uses N-2 threads by default (reserves capacity for stems and export)
+- **Lightweight WASM mode:** Optional `wasm-lite` build exposes `analyzePcm(...)` for pre-decoded PCM input and a compact browser bundle
 
 ### Stem Separation
 - **Model:** HTDemucs v4 via ONNX Runtime 2.0
